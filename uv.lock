@@ -34,7 +34,7 @@ wheels = [
 ]
 
 [[package]]
-name = "ducklake-ivm"
+name = "duckstream"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

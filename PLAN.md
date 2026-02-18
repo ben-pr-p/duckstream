@@ -72,11 +72,11 @@ SELECT * FROM ducklake_table_changes('dl', 'main', 't', 3, 7)
 ## Step 0: Dataclasses and Module Structure
 
 **Files to create/modify:**
-- `src/ducklake_ivm/plan.py` — new file for `IVMPlan` and `Naming`
-- `src/ducklake_ivm/__init__.py` — re-export public API
-- `src/ducklake_ivm/compiler.py` — update signature
+- `src/duckstream/plan.py` — new file for `IVMPlan` and `Naming`
+- `src/duckstream/__init__.py` — re-export public API
+- `src/duckstream/compiler.py` — update signature
 
-### `src/ducklake_ivm/plan.py`
+### `src/duckstream/plan.py`
 
 ```python
 from dataclasses import dataclass, field
@@ -111,14 +111,14 @@ class UnsupportedSQLError(Exception):
         super().__init__(message)
 ```
 
-### `src/ducklake_ivm/__init__.py`
+### `src/duckstream/__init__.py`
 
 ```python
-from ducklake_ivm.plan import IVMPlan, Naming, UnsupportedSQLError
-from ducklake_ivm.compiler import compile_ivm
+from duckstream.plan import IVMPlan, Naming, UnsupportedSQLError
+from duckstream.compiler import compile_ivm
 ```
 
-### `src/ducklake_ivm/compiler.py` — new signature
+### `src/duckstream/compiler.py` — new signature
 
 ```python
 def compile_ivm(
@@ -615,9 +615,9 @@ def get_non_aux_columns(con, catalog, plan):
 ## Step 4: Implementation Order
 
 ### Phase 1: Infrastructure (Step 0)
-1. Create `src/ducklake_ivm/plan.py` with `IVMPlan`, `Naming`, `UnsupportedSQLError`
-2. Update `src/ducklake_ivm/__init__.py` to re-export
-3. Update `src/ducklake_ivm/compiler.py` with new signature (still raises `NotImplementedError`)
+1. Create `src/duckstream/plan.py` with `IVMPlan`, `Naming`, `UnsupportedSQLError`
+2. Update `src/duckstream/__init__.py` to re-export
+3. Update `src/duckstream/compiler.py` with new signature (still raises `NotImplementedError`)
 4. Update `tests/test_ivm.py` to use the new `IVMPlan` protocol in `assert_ivm_correct`
 5. Verify tests still fail with `NotImplementedError`
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlglot
 from sqlglot import exp
 
-from ducklake_ivm.plan import IVMPlan, Naming, UnsupportedSQLError
+from duckstream.plan import IVMPlan, Naming, UnsupportedSQLError
 
 
 def compile_ivm(

@@ -9,11 +9,11 @@ Built on **sqlglot** for SQL parsing/generation and **DuckLake** for change trac
 ## Project Layout
 
 ```
-ducklake-ivm/
+duckstream/
 ├── pyproject.toml                  # Project config, dependencies, build system
 ├── main.py                         # Entry point placeholder
 │
-├── src/ducklake_ivm/               # Library source
+├── src/duckstream/               # Library source
 │   ├── __init__.py                 # Package root (public API re-exports)
 │   └── compiler.py                 # compile_ivm() — the core compiler (stub)
 │
@@ -43,7 +43,7 @@ Managed by **uv**. Python 3.13+.
 
 ## Key Concepts
 
-### The Compiler (`src/ducklake_ivm/compiler.py`)
+### The Compiler (`src/duckstream/compiler.py`)
 
 The library's public API is a single function:
 

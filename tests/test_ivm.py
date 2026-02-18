@@ -16,7 +16,7 @@ import tempfile
 import duckdb
 from hypothesis import HealthCheck, given, settings
 
-from ducklake_ivm import compile_ivm
+from duckstream import compile_ivm
 from tests.conftest import DUCKLAKE_CATALOG
 from tests.strategies import (
     Column,

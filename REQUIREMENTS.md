@@ -17,7 +17,7 @@ An optional execution helper may be added later as a separate module.
 The single entry point. Takes a view definition (a SELECT statement as a string) and returns a structured plan containing all the SQL needed to create and maintain the materialized view.
 
 ```python
-from ducklake_ivm import compile_ivm
+from duckstream import compile_ivm
 
 # Simple case: all tables in one catalog
 plan = compile_ivm(
@@ -56,7 +56,7 @@ plan = compile_ivm(
 A class with overridable methods that control all generated names. Subclass to customize.
 
 ```python
-from ducklake_ivm import Naming
+from duckstream import Naming
 
 class Naming:
     """Default naming strategy. Subclass to override any method."""
@@ -218,7 +218,7 @@ DuckLake allows expiring old snapshots to reclaim storage. However, expiring a s
 Generates a single SQL query that reports, for each source catalog, the minimum snapshot that is still required by any MV and therefore the maximum snapshot that is safe to expire.
 
 ```python
-from ducklake_ivm import safe_to_expire_sql
+from duckstream import safe_to_expire_sql
 
 # Which catalogs have MV cursors tables, and which catalogs are sources
 sql = safe_to_expire_sql(
@@ -266,7 +266,7 @@ The caller provides the full list of MV catalogs so the query can scan all of th
 ### Example: Expire old snapshots
 
 ```python
-from ducklake_ivm import safe_to_expire_sql
+from duckstream import safe_to_expire_sql
 
 sql = safe_to_expire_sql(
     mv_catalogs=["analytics", "reporting"],
@@ -295,7 +295,7 @@ Before running maintenance, the caller may want to know: which MVs have pending 
 Generates a SQL query that reports, for each MV in the given catalogs, how many changes are pending per source table and the MV that would be updated.
 
 ```python
-from ducklake_ivm import pending_maintenance_sql
+from duckstream import pending_maintenance_sql
 
 sql = pending_maintenance_sql(mv_catalogs=["analytics", "reporting"])
 
@@ -332,7 +332,7 @@ The generated SQL works by joining each `_ivm_cursors` row against `ducklake_tab
 ### Example: Selective maintenance
 
 ```python
-from ducklake_ivm import pending_maintenance_sql
+from duckstream import pending_maintenance_sql
 
 sql = pending_maintenance_sql(mv_catalogs=["analytics"])
 
@@ -351,7 +351,7 @@ for mv_cat, mv_name, src_cat, src_table, n_changes, n_snaps in con.execute(sql).
 ## Error Handling
 
 ```python
-from ducklake_ivm import compile_ivm, UnsupportedSQLError
+from duckstream import compile_ivm, UnsupportedSQLError
 
 try:
     plan = compile_ivm("SELECT *, ROW_NUMBER() OVER (...) FROM t")
@@ -385,7 +385,7 @@ Supported features and their status:
 
 ```python
 import duckdb
-from ducklake_ivm import compile_ivm
+from duckstream import compile_ivm
 
 con = duckdb.connect()
 con.execute("INSTALL ducklake; LOAD ducklake")
@@ -424,7 +424,7 @@ for stmt in plan.maintain:
 
 ```python
 import duckdb
-from ducklake_ivm import compile_ivm
+from duckstream import compile_ivm
 
 con = duckdb.connect()
 con.execute("INSTALL ducklake; LOAD ducklake")
