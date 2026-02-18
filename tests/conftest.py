@@ -195,9 +195,13 @@ def assert_ivm_correct(scenario: Scenario, ducklake_fixture):
     for stmt in plan.maintain:
         con.execute(stmt)
 
-    # 6. Read maintained MV (excluding _ivm_* columns)
-    mv_fqn = f"{catalog}.main.mv"
-    maintained = read_mv(con, mv_fqn)
+    # 6. Read maintained MV (excluding _ivm_* columns, applying HAVING if present)
+    if plan.query_mv:
+        result = con.execute(plan.query_mv).fetchall()
+        maintained = sorted(result, key=_null_safe_sort_key)
+    else:
+        mv_fqn = f"{catalog}.main.mv"
+        maintained = read_mv(con, mv_fqn)
 
     # 7. Recompute from scratch and compare
     expected = recompute_view(con, scenario.view_sql, catalog)

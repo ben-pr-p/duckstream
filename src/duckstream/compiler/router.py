@@ -17,6 +17,7 @@ from duckstream.compiler.infrastructure import (
     _gen_create_cursors,
     _gen_create_mv,
     _gen_init_cursor,
+    _gen_query_mv,
     _resolve_source,
 )
 from duckstream.compiler.join import _compile_join
@@ -58,8 +59,13 @@ def compile_ivm(
     tables = list(ast.find_all(exp.Table))
     has_agg = bool(list(ast.find_all(exp.AggFunc)))
     has_distinct = bool(ast.args.get("distinct"))
+    has_having = bool(ast.args.get("having"))
     joins = ast.args.get("joins")
     has_join = bool(joins)
+
+    # HAVING requires GROUP BY / aggregates
+    if has_having and not has_agg:
+        raise UnsupportedSQLError("having_no_agg", "HAVING requires GROUP BY with aggregates")
 
     if not tables:
         raise UnsupportedSQLError("no_table", "No tables found in view SQL")
@@ -127,6 +133,7 @@ def compile_ivm(
         maintain = _gen_select_maintenance(ast, mv_fqn, cursors_fqn, mv_table, src, dialect)
 
     features = _detect_features(ast)
+    query_mv = _gen_query_mv(ast, mv_fqn, naming, dialect)
 
     return IVMPlan(
         view_sql=ast.sql(dialect=dialect),
@@ -136,4 +143,5 @@ def compile_ivm(
         maintain=maintain,
         base_tables={table_name: src["catalog"]},
         features=features,
+        query_mv=query_mv,
     )

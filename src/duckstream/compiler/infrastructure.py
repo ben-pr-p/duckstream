@@ -62,6 +62,10 @@ def _gen_create_mv(
         group_exprs = [exp.column(c) for c in out_cols]
         qualified_ast.args["group"] = exp.Group(expressions=group_exprs)
 
+    # Strip HAVING — MV stores all groups; HAVING is applied at read time via query_mv
+    if qualified_ast.args.get("having"):
+        qualified_ast.args.pop("having")
+
     if has_agg:
         # Add _ivm_count to the SELECT for aggregate views
         count_alias = naming.aux_column("count")
@@ -121,6 +125,10 @@ def _gen_create_mv_join(
             else node
         )
     )
+
+    # Strip HAVING — MV stores all groups; HAVING is applied at read time via query_mv
+    if qualified_ast.args.get("having"):
+        qualified_ast.args.pop("having")
 
     if has_agg and naming:
         count_alias = naming.aux_column("count")
@@ -318,6 +326,8 @@ def _detect_features(ast: exp.Select) -> set[str]:
         features.add("distinct")
     if ast.args.get("group"):
         features.add("group_by")
+    if ast.args.get("having"):
+        features.add("having")
     if ast.args.get("joins"):
         features.add("join")
         for j in ast.args["joins"]:
@@ -339,3 +349,79 @@ def _detect_features(ast: exp.Select) -> set[str]:
         elif isinstance(agg, exp.Max):
             features.add("max")
     return features
+
+
+# ---------------------------------------------------------------------------
+# HAVING support
+# ---------------------------------------------------------------------------
+
+
+def _having_to_where(
+    having_expr: exp.Expression,
+    ast: exp.Select,
+    naming: Naming,
+    dialect: str,
+) -> str:
+    """Convert a HAVING expression to a WHERE clause for query_mv.
+
+    Maps aggregate function references to their MV column aliases.
+    COUNT(*) without a SELECT alias maps to the internal _ivm_count column.
+    """
+    # Build mapping: normalized aggregate SQL -> MV column alias
+    agg_to_alias: dict[str, str] = {}
+    for sel in ast.selects:
+        alias_name = sel.alias if isinstance(sel, exp.Alias) else None
+        inner = sel.this if isinstance(sel, exp.Alias) else sel
+        if isinstance(inner, exp.AggFunc) and alias_name:
+            # Normalize: generate SQL without table qualifiers for matching
+            norm_key = inner.sql(dialect=dialect)
+            agg_to_alias[norm_key] = alias_name
+
+    ivm_count = naming.aux_column("count")
+
+    def _replace_agg(node: exp.Expression) -> exp.Expression:
+        if isinstance(node, exp.AggFunc):
+            # Check for exact match in SELECT aliases
+            norm = node.sql(dialect=dialect)
+            if norm in agg_to_alias:
+                return exp.column(agg_to_alias[norm])
+            # COUNT(*) maps to _ivm_count
+            if isinstance(node, exp.Count) and isinstance(node.this, exp.Star):
+                return exp.column(ivm_count)
+        return node
+
+    where_expr = having_expr.copy().transform(_replace_agg)
+    return where_expr.sql(dialect=dialect)
+
+
+def _gen_query_mv(
+    ast: exp.Select,
+    mv_fqn: str,
+    naming: Naming,
+    dialect: str,
+) -> str:
+    """Generate a SELECT query to read visible MV rows, excluding _ivm_* columns.
+
+    For views with HAVING, adds a WHERE clause that filters by the HAVING condition.
+    """
+    # Collect visible column names (non-_ivm_* columns from the SELECT)
+    visible_cols: list[str] = []
+    for sel in ast.selects:
+        if isinstance(sel, exp.Alias):
+            name = sel.alias
+        elif isinstance(sel, exp.Column):
+            name = sel.name
+        else:
+            name = sel.sql(dialect=dialect)
+        if not name.startswith("_ivm_"):
+            visible_cols.append(name)
+
+    cols_sql = ", ".join(visible_cols) if visible_cols else "*"
+    query = f"SELECT {cols_sql} FROM {mv_fqn}"
+
+    having_node = ast.args.get("having")
+    if having_node:
+        where_sql = _having_to_where(having_node.this, ast, naming, dialect)
+        query += f" WHERE {where_sql}"
+
+    return query

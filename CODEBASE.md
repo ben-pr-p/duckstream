@@ -13,19 +13,50 @@ duckstream/
 ├── pyproject.toml                  # Project config, dependencies, build system
 ├── main.py                         # Entry point placeholder
 │
-├── src/duckstream/               # Library source
+├── src/duckstream/                 # Library source
 │   ├── __init__.py                 # Package root (public API re-exports)
-│   └── compiler.py                 # compile_ivm() — the core compiler (stub)
+│   ├── plan.py                     # IVMPlan, Naming, UnsupportedSQLError dataclasses
+│   ├── utils.py                    # safe_to_expire_sql(), pending_maintenance_sql()
+│   └── compiler/                   # Core compiler modules
+│       ├── __init__.py             # Package root
+│       ├── router.py               # compile_ivm() orchestrator — routes to feature modules
+│       ├── select.py               # Stage 1: SELECT/PROJECT/WHERE
+│       ├── aggregates.py           # Stage 2-3: GROUP BY + SUM/COUNT/AVG/MIN/MAX
+│       ├── join.py                 # Stage 4,8: N-table inner JOIN
+│       ├── join_aggregate.py       # Stage 5: JOIN + aggregates composed
+│       ├── distinct.py             # Stage 6: SELECT DISTINCT
+│       ├── outer_join.py           # Stage 9: LEFT/RIGHT/FULL OUTER JOIN
+│       ├── set_ops.py              # Stage 10: UNION/EXCEPT/INTERSECT
+│       └── infrastructure.py       # Shared helpers: DDL, cursors, snapshots, column rewriting
 │
 ├── tests/                          # Test suite
 │   ├── __init__.py
-│   ├── conftest.py                 # DuckLake test fixture (isolated temp dirs)
-│   ├── strategies.py               # Hypothesis strategies for random test scenarios
-│   └── test_ivm.py                 # Property-based + smoke tests
+│   ├── conftest.py                 # DuckLake fixture, oracle harness (assert_ivm_correct)
+│   ├── strategies/                 # Hypothesis strategies for random test generation
+│   │   ├── __init__.py             # Re-exports all strategies
+│   │   ├── primitives.py           # Table, Column, Row, Delta, Scenario types
+│   │   ├── select.py               # single_table_select()
+│   │   ├── aggregate.py            # single_table_aggregate()
+│   │   ├── having.py               # single_table_having()
+│   │   ├── distinct.py             # single_table_distinct()
+│   │   ├── join.py                 # two_table_join(), three_table_join()
+│   │   ├── join_aggregate.py       # join_then_aggregate()
+│   │   ├── outer_join.py           # two_table_outer_join()
+│   │   └── set_ops.py              # set_operation()
+│   ├── test_select.py              # Stage 1 tests
+│   ├── test_aggregate.py           # Stage 2-3 tests
+│   ├── test_having.py              # HAVING tests
+│   ├── test_distinct.py            # Stage 6 tests
+│   ├── test_join.py                # Stage 4,8 tests
+│   ├── test_join_aggregate.py      # Stage 5 tests
+│   ├── test_outer_join.py          # Stage 9 tests
+│   ├── test_set_ops.py             # Stage 10 tests
+│   └── test_utils.py               # Utility function tests
 │
-├── CONVERSATION.md                 # Research context: prior art, DBSP theory, initial plan
+├── bag-algebra-vs-z-sets.md        # Why classical bag algebra, not DBSP Z-sets
+├── PLAN.md                         # Concrete implementation plan with SQL patterns
 ├── REQUIREMENTS.md                 # Python API specification
-├── EVOLUTION.md                    # Stage-by-stage implementation + testing plan
+├── EVOLUTION.md                    # Stage-by-stage roadmap
 └── CODEBASE.md                     # This file
 ```
 
@@ -43,7 +74,7 @@ Managed by **uv**. Python 3.13+.
 
 ## Key Concepts
 
-### The Compiler (`src/duckstream/compiler.py`)
+### The Compiler (`src/duckstream/compiler/`)
 
 The library's public API is a single function:
 
@@ -56,20 +87,30 @@ It takes a SQL SELECT statement and returns an `IVMPlan` dataclass containing:
 - `create_mv` — DDL to create and populate the materialized view
 - `initialize_cursors` — DML to set initial cursor positions
 - `maintain` — ordered list of DML statements that read deltas from `ducklake_table_changes()`, apply them to the MV, and update the cursors
+- `query_mv` — SELECT query to read the MV, excluding auxiliary columns and applying HAVING filter if present
 
 The compiler is pure — no side effects, no connections. It just transforms SQL into SQL.
 
-### Planned Source Modules
-
-As the compiler grows beyond `compiler.py`, it will split into:
+### Compiler Modules
 
 | Module | Responsibility |
 |--------|---------------|
-| `compiler.py` | Top-level `compile_ivm()` orchestrator |
-| `rewriter.py` | Bag algebra delta rules — the core AST transformation logic |
-| `naming.py` | `Naming` class for customizable table/column naming |
-| `plan.py` | `IVMPlan`, `SnapshotSafety`, `PendingMaintenance` dataclasses |
-| `introspection.py` | `safe_to_expire_sql()`, `pending_maintenance_sql()` |
+| `router.py` | Top-level `compile_ivm()` orchestrator — detects features and routes to the right module |
+| `select.py` | Single-table SELECT/PROJECT/WHERE maintenance |
+| `aggregates.py` | GROUP BY with SUM, COUNT, AVG, MIN, MAX |
+| `join.py` | N-table inner JOIN via inclusion-exclusion decomposition |
+| `join_aggregate.py` | JOIN + aggregates composition |
+| `distinct.py` | DISTINCT via multiplicity tracking |
+| `outer_join.py` | LEFT/RIGHT/FULL OUTER JOIN with NULL extension handling |
+| `set_ops.py` | UNION/EXCEPT/INTERSECT (ALL and DISTINCT variants) |
+| `infrastructure.py` | Shared helpers: DDL generation, snapshot variables, column rewriting, feature detection, HAVING support |
+
+### Utility Functions (`src/duckstream/utils.py`)
+
+| Function | Purpose |
+|----------|---------|
+| `safe_to_expire_sql()` | Reports which snapshots are safe to expire across source catalogs |
+| `pending_maintenance_sql()` | Reports pending maintenance work per MV |
 
 ### DuckLake Integration
 
@@ -91,13 +132,6 @@ A shared `_ivm_cursors` table in the MV's catalog tracks, per MV and per source 
 _ivm_cursors (mv_name, source_catalog, last_snapshot)
 ```
 
-### Introspection Functions
-
-Two additional functions generate SQL queries (not part of `IVMPlan`):
-
-- **`safe_to_expire_sql(mv_catalogs, source_catalogs)`** — reports which snapshots are safe to expire across all source catalogs, by finding the minimum cursor across all MVs
-- **`pending_maintenance_sql(mv_catalogs)`** — reports how many pending changes and unprocessed snapshots exist per MV per source table
-
 ## Delta Rules (How the Rewrites Work)
 
 The compiler uses **classical bag algebra** (as in pg_ivm) rather than DBSP Z-sets. DuckLake gives us post-update table state and separate insert/delete transition tables via `ducklake_table_changes()`, which maps directly to the bag algebra model. See `bag-algebra-vs-z-sets.md` for the full rationale.
@@ -114,6 +148,7 @@ Notation: `R` = post-update (current) table state, `ΔR` = inserted rows, `∇R`
 | AVG | Maintained via hidden SUM and COUNT columns |
 | MIN / MAX | Rescan fallback when current extremum is deleted |
 | DISTINCT | Multiplicity counter; row appears/disappears at 0-crossing |
+| HAVING | MV stores all groups; `query_mv` filters by HAVING condition at read time |
 
 The critical property: **the incremental form of a composition is the composition of incremental forms**. Each node is rewritten independently.
 
@@ -138,7 +173,7 @@ Each test gets its own DuckLake instance via a random temp directory (`tempfile.
 
 The `ducklake` fixture creates a fresh DuckLake catalog (`dl`) in a temp directory, yields `(connection, catalog_name)`, and cleans up after.
 
-### Hypothesis Strategies (`tests/strategies.py`)
+### Hypothesis Strategies (`tests/strategies/`)
 
 Strategies generate random `Scenario` objects containing:
 - `tables` — random schemas (2-5 columns, mixed types)
@@ -148,34 +183,38 @@ Strategies generate random `Scenario` objects containing:
 
 Current strategies:
 - `single_table_select()` — SELECT/PROJECT/WHERE
-- `single_table_aggregate()` — GROUP BY with SUM/COUNT/AVG
-
-### Test File (`tests/test_ivm.py`)
-
-- **Property tests** — `test_select_project_filter`, `test_single_table_aggregate` — 50 Hypothesis examples each
-- **Smoke tests** — `TestSmoke` class with 4 hand-written deterministic scenarios
+- `single_table_aggregate()` — GROUP BY with SUM/COUNT/AVG/MIN/MAX
+- `single_table_having()` — GROUP BY with HAVING clause
+- `single_table_distinct()` — SELECT DISTINCT
+- `two_table_join()` / `three_table_join()` — N-table inner JOINs
+- `join_then_aggregate()` — JOIN + GROUP BY composed
+- `two_table_outer_join()` — LEFT/RIGHT/FULL OUTER JOIN
+- `set_operation()` — UNION/EXCEPT/INTERSECT
 
 ### Running Tests
 
 ```bash
-uv run pytest                                          # all tests
-uv run pytest tests/test_ivm.py::TestSmoke             # smoke tests only
-uv run pytest tests/test_ivm.py::test_select_project_filter -x  # one property test
-uv run pytest -n auto                                  # parallel execution
+uv run pytest                                  # all tests
+uv run pytest tests/test_having.py -x          # HAVING tests
+uv run pytest tests/test_utils.py -v           # utility function tests
+uv run pytest -n auto                          # parallel execution
 ```
 
 ## Implementation Status
 
-The compiler is a stub (`NotImplementedError`). The test infrastructure is fully wired — tests are collected and fail with `NotImplementedError` as expected, ready for implementation.
+All 10 stages from EVOLUTION.md are complete, plus:
+- **HAVING** support — MV stores all groups, `query_mv` filters at read time
+- **Utility functions** — `safe_to_expire_sql()` and `pending_maintenance_sql()`
+- **`query_mv`** field on `IVMPlan` — SELECT query for reading the MV (excludes auxiliary columns, applies HAVING)
 
-See `EVOLUTION.md` for the stage-by-stage plan from Stage 1 (SELECT/WHERE) through Stage 10 (set operations).
+See `EVOLUTION.md` for the stage-by-stage plan and future/deferred features.
 
 ## Documentation Map
 
 | File | Contents |
 |------|----------|
 | `bag-algebra-vs-z-sets.md` | Why classical bag algebra (not DBSP Z-sets) is the right model — delta rules, SQL patterns, algorithmic complexity |
-| `CONVERSATION.md` | Research context: prior art survey (RisingWave, Feldera, OpenIVM, pg_ivm), DBSP theory, initial architecture sketch |
 | `REQUIREMENTS.md` | Python API specification: `compile_ivm()`, `IVMPlan`, `Naming`, snapshot cursors, cross-catalog support, `safe_to_expire_sql()`, `pending_maintenance_sql()`, error handling, full workflow examples |
 | `EVOLUTION.md` | Implementation roadmap: 10 stages from simple SELECT through set operations, testing philosophy, per-stage compiler work + test strategies + done criteria |
+| `PLAN.md` | Concrete implementation plan with exact SQL patterns, sqlglot API usage |
 | `CODEBASE.md` | This file: project layout, key concepts, test architecture, implementation status |

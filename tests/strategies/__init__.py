@@ -2,6 +2,7 @@
 
 from tests.strategies.aggregate import single_table_aggregate
 from tests.strategies.distinct import single_table_distinct
+from tests.strategies.having import single_table_having
 from tests.strategies.join import three_table_join, two_table_join
 from tests.strategies.join_aggregate import join_then_aggregate
 from tests.strategies.outer_join import two_table_outer_join
@@ -41,6 +42,7 @@ __all__ = [
     "set_operation",
     "single_table_aggregate",
     "single_table_distinct",
+    "single_table_having",
     "single_table_select",
     "table_names",
     "three_table_join",
