@@ -1,8 +1,8 @@
 """Hypothesis strategies for generating IVM test scenarios."""
 
 from dataclasses import dataclass
-from hypothesis import strategies as st
 
+from hypothesis import strategies as st
 
 # ---------------------------------------------------------------------------
 # Primitives
@@ -23,6 +23,7 @@ def col_type(draw):
 # ---------------------------------------------------------------------------
 # Schema generation
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class Column:
@@ -53,6 +54,7 @@ class Row:
 @dataclass
 class Delta:
     """A set of rows to insert (+1) or delete (-1) from a table."""
+
     table_name: str
     inserts: list[Row]
     deletes: list[Row]
@@ -65,6 +67,7 @@ class Scenario:
     view_sql uses unqualified table names. The test harness qualifies them
     with the DuckLake catalog name at runtime.
     """
+
     tables: list[Table]
     initial_data: dict[str, list[Row]]  # table_name -> rows
     view_sql: str
@@ -74,6 +77,7 @@ class Scenario:
 # ---------------------------------------------------------------------------
 # Value generators per column type
 # ---------------------------------------------------------------------------
+
 
 def value_for_type(dtype: str):
     if dtype == "INTEGER":
@@ -107,6 +111,7 @@ def rows_for_table(draw, table: Table, min_size=0, max_size=10):
 # Scenario strategies — one per SQL fragment class
 # ---------------------------------------------------------------------------
 
+
 @st.composite
 def single_table_select(draw):
     """Scenario: SELECT <cols> FROM <table> [WHERE <predicate>]."""
@@ -124,12 +129,14 @@ def single_table_select(draw):
 
     initial_rows = draw(rows_for_table(table, min_size=1, max_size=15))
 
-    proj_cols = draw(st.lists(
-        st.sampled_from(table.col_names),
-        min_size=1,
-        max_size=len(table.col_names),
-        unique=True,
-    ))
+    proj_cols = draw(
+        st.lists(
+            st.sampled_from(table.col_names),
+            min_size=1,
+            max_size=len(table.col_names),
+            unique=True,
+        )
+    )
     select_clause = ", ".join(proj_cols)
 
     add_where = draw(st.booleans())
@@ -141,14 +148,18 @@ def single_table_select(draw):
 
     delta_inserts = draw(rows_for_table(table, min_size=0, max_size=5))
     n_deletes = draw(st.integers(min_value=0, max_value=min(3, len(initial_rows))))
-    delete_indices = draw(
-        st.lists(
-            st.integers(min_value=0, max_value=len(initial_rows) - 1),
-            min_size=n_deletes,
-            max_size=n_deletes,
-            unique=True,
+    delete_indices = (
+        draw(
+            st.lists(
+                st.integers(min_value=0, max_value=len(initial_rows) - 1),
+                min_size=n_deletes,
+                max_size=n_deletes,
+                unique=True,
+            )
         )
-    ) if n_deletes > 0 and initial_rows else []
+        if n_deletes > 0 and initial_rows
+        else []
+    )
     delta_deletes = [initial_rows[i] for i in delete_indices]
 
     delta = Delta(table_name=tname, inserts=delta_inserts, deletes=delta_deletes)
@@ -193,14 +204,18 @@ def single_table_aggregate(draw):
 
     delta_inserts = draw(rows_for_table(table, min_size=0, max_size=5))
     n_deletes = draw(st.integers(min_value=0, max_value=min(3, len(initial_rows))))
-    delete_indices = draw(
-        st.lists(
-            st.integers(min_value=0, max_value=len(initial_rows) - 1),
-            min_size=n_deletes,
-            max_size=n_deletes,
-            unique=True,
+    delete_indices = (
+        draw(
+            st.lists(
+                st.integers(min_value=0, max_value=len(initial_rows) - 1),
+                min_size=n_deletes,
+                max_size=n_deletes,
+                unique=True,
+            )
         )
-    ) if n_deletes > 0 else []
+        if n_deletes > 0
+        else []
+    )
     delta_deletes = [initial_rows[i] for i in delete_indices]
 
     delta = Delta(table_name=tname, inserts=delta_inserts, deletes=delta_deletes)

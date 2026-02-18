@@ -5,22 +5,530 @@ Takes a SQL view definition and emits SQL statements that propagate
 deltas from base tables into the materialized view.
 """
 
+from __future__ import annotations
+
 import sqlglot
 from sqlglot import exp
 
+from ducklake_ivm.plan import IVMPlan, Naming, UnsupportedSQLError
 
-def compile_ivm(view_sql: str, dialect: str = "duckdb") -> dict:
-    """Compile a view definition into IVM maintenance SQL.
 
-    Args:
-        view_sql: The SELECT statement defining the view.
-        dialect: Target SQL dialect (default: duckdb).
+def compile_ivm(
+    view_sql: str,
+    *,
+    dialect: str = "duckdb",
+    naming: Naming | None = None,
+    mv_catalog: str = "dl",
+    mv_schema: str = "main",
+    sources: dict[str, dict] | None = None,
+) -> IVMPlan:
+    """Compile a view definition into IVM maintenance SQL."""
+    naming = naming or Naming()
+    parsed = sqlglot.parse_one(view_sql, dialect=dialect)
+    assert isinstance(parsed, exp.Select), f"Expected SELECT, got {type(parsed)}"
+    ast: exp.Select = parsed
 
-    Returns:
-        A dict with keys:
-            - "create_mv": CREATE TABLE AS statement for initial materialization
-            - "create_deltas": list of CREATE TABLE statements for delta tables
-            - "maintain": list of DML statements to propagate deltas into the MV
-            - "base_tables": list of base table names referenced
+    # --- Analysis ---
+    tables = list(ast.find_all(exp.Table))
+    has_agg = bool(list(ast.find_all(exp.AggFunc)))
+    has_join = bool(ast.args.get("joins"))
+
+    if has_join:
+        raise UnsupportedSQLError("join", "Joins not yet supported")
+
+    if not tables:
+        raise UnsupportedSQLError("no_table", "No tables found in view SQL")
+
+    # --- Resolve source ---
+    table = tables[0]
+    table_name = table.name
+    src = _resolve_source(table_name, sources, mv_catalog, mv_schema)
+
+    mv_table = naming.mv_table()
+    mv_fqn = f"{mv_catalog}.{mv_schema}.{mv_table}"
+    cursors_fqn = f"{mv_catalog}.{mv_schema}.{naming.cursors_table()}"
+
+    # --- Generate SQL ---
+    create_cursors = _gen_create_cursors(cursors_fqn)
+    create_mv = _gen_create_mv(ast, mv_fqn, src, dialect, has_agg, naming)
+    init_cursors = [_gen_init_cursor(cursors_fqn, mv_table, src)]
+
+    if has_agg:
+        maintain = _gen_aggregate_maintenance(
+            ast, mv_fqn, cursors_fqn, mv_table, src, dialect, naming
+        )
+    else:
+        maintain = _gen_select_maintenance(ast, mv_fqn, cursors_fqn, mv_table, src, dialect)
+
+    features = _detect_features(ast)
+
+    return IVMPlan(
+        view_sql=ast.sql(dialect=dialect),
+        create_cursors_table=create_cursors,
+        create_mv=create_mv,
+        initialize_cursors=init_cursors,
+        maintain=maintain,
+        base_tables={table_name: src["catalog"]},
+        features=features,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_source(
+    table_name: str,
+    sources: dict[str, dict] | None,
+    mv_catalog: str,
+    mv_schema: str,
+) -> dict[str, str]:
+    if sources and table_name in sources:
+        return {
+            "catalog": sources[table_name].get("catalog", mv_catalog),
+            "schema": sources[table_name].get("schema", "main"),
+            "table": table_name,
+        }
+    return {"catalog": mv_catalog, "schema": mv_schema, "table": table_name}
+
+
+# ---------------------------------------------------------------------------
+# DDL generation
+# ---------------------------------------------------------------------------
+
+
+def _gen_create_cursors(cursors_fqn: str) -> str:
+    return (
+        f"CREATE TABLE IF NOT EXISTS {cursors_fqn} (\n"
+        f"    mv_name VARCHAR,\n"
+        f"    source_catalog VARCHAR,\n"
+        f"    last_snapshot BIGINT\n"
+        f")"
+    )
+
+
+def _gen_create_mv(
+    ast: exp.Select,
+    mv_fqn: str,
+    src: dict[str, str],
+    dialect: str,
+    has_agg: bool,
+    naming: Naming,
+) -> str:
+    # Replace unqualified table ref with fully-qualified source
+    table_name = src["table"]
+    qualified_ast: exp.Select = ast.copy().transform(  # type: ignore[assignment]
+        lambda node: (
+            exp.table_(table_name, db=src["schema"], catalog=src["catalog"])
+            if isinstance(node, exp.Table) and node.name == table_name
+            else node
+        )
+    )
+
+    if has_agg:
+        # Add _ivm_count to the SELECT for aggregate views
+        count_alias = naming.aux_column("count")
+        count_expr = exp.alias_(exp.Count(this=exp.Star()), count_alias)
+        qualified_ast.args["expressions"].append(count_expr)
+
+        # For AVG, we also need _ivm_sum — handle the SELECT expressions
+        new_selects = []
+        for sel in list(qualified_ast.selects):
+            alias_name = sel.alias if isinstance(sel, exp.Alias) else None
+            inner = sel.this if isinstance(sel, exp.Alias) else sel
+            if isinstance(inner, exp.Avg):
+                # Replace AVG(x) with SUM(x) as _ivm_sum_<alias>, keep alias for computed col
+                sum_col = naming.aux_column(f"sum_{alias_name or 'val'}")
+                new_selects.append(exp.alias_(exp.Sum(this=inner.this.copy()), sum_col))
+                # The actual AVG column will be computed as _ivm_sum / _ivm_count
+                # We store it as the user-facing alias
+                new_selects.append(
+                    exp.alias_(
+                        exp.Div(
+                            this=exp.Cast(
+                                this=exp.Sum(this=inner.this.copy()),
+                                to=exp.DataType(this=exp.DataType.Type.DOUBLE),
+                            ),
+                            expression=exp.Count(this=exp.Star()),
+                        ),
+                        alias_name or "avg_val",
+                    )
+                )
+            else:
+                new_selects.append(sel)
+        # Re-add the _ivm_count (it was already appended above, so we need to handle carefully)
+        # Actually let's rebuild: remove old selects, add new ones + _ivm_count
+        qualified_ast.args["expressions"] = new_selects
+        # Check if _ivm_count already added (it was appended to original expressions)
+        has_ivm_count = any(
+            (isinstance(s, exp.Alias) and s.alias == count_alias) for s in qualified_ast.selects
+        )
+        if not has_ivm_count:
+            qualified_ast.args["expressions"].append(count_expr)
+
+    return f"CREATE TABLE {mv_fqn} AS {qualified_ast.sql(dialect=dialect)}"
+
+
+def _gen_init_cursor(cursors_fqn: str, mv_table: str, src: dict[str, str]) -> str:
+    return (
+        f"INSERT INTO {cursors_fqn} (mv_name, source_catalog, last_snapshot)\n"
+        f"VALUES ('{mv_table}', '{src['catalog']}',\n"
+        f"    (SELECT MAX(snapshot_id) FROM ducklake_snapshots('{src['catalog']}')))"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Column rewriting
+# ---------------------------------------------------------------------------
+
+
+def _repoint_columns_to_delta(node: exp.Expression) -> exp.Expression:
+    """Repoint column references to the _delta alias."""
+    if isinstance(node, exp.Column):
+        return exp.column(node.name, table="_delta")
+    return node
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: SELECT / PROJECT / WHERE maintenance
+# ---------------------------------------------------------------------------
+
+
+def _extract_output_col_names(ast: exp.Select) -> list[str]:
+    """Get the output column names from the SELECT clause."""
+    names = []
+    for sel in ast.selects:
+        if isinstance(sel, exp.Alias):
+            names.append(sel.alias)
+        elif isinstance(sel, exp.Column):
+            names.append(sel.name)
+        else:
+            names.append(sel.sql())
+    return names
+
+
+def _gen_set_snapshot_vars(src: dict[str, str], cursors_fqn: str, mv_table: str) -> list[str]:
+    """Generate SET VARIABLE statements to capture snapshot range.
+
+    DuckDB doesn't allow subqueries inside table function arguments,
+    so we capture the values into variables first.
     """
-    raise NotImplementedError("IVM compilation not yet implemented")
+    return [
+        (
+            f"SET VARIABLE _ivm_snap_start = (\n"
+            f"    SELECT last_snapshot + 1 FROM {cursors_fqn}\n"
+            f"    WHERE mv_name = '{mv_table}' AND source_catalog = '{src['catalog']}'\n"
+            f")"
+        ),
+        (
+            f"SET VARIABLE _ivm_snap_end = (\n"
+            f"    SELECT MAX(snapshot_id) FROM ducklake_snapshots('{src['catalog']}')\n"
+            f")"
+        ),
+    ]
+
+
+def _gen_changes_cte(src: dict[str, str]) -> str:
+    """Generate the _changes CTE that reads ducklake_table_changes().
+
+    Assumes _ivm_snap_start and _ivm_snap_end variables have been set.
+    """
+    return (
+        f"_changes AS (\n"
+        f"    SELECT * FROM ducklake_table_changes(\n"
+        f"        '{src['catalog']}', '{src['schema']}', '{src['table']}',\n"
+        f"        getvariable('_ivm_snap_start'),\n"
+        f"        getvariable('_ivm_snap_end')\n"
+        f"    )\n"
+        f")"
+    )
+
+
+def _gen_where_clause(ast: exp.Select, dialect: str) -> str:
+    """Extract and repoint the WHERE clause for delta queries."""
+    original_where = ast.args.get("where")
+    if original_where:
+        delta_where = original_where.this.copy().transform(_repoint_columns_to_delta)
+        return f" AND {delta_where.sql(dialect=dialect)}"
+    return ""
+
+
+def _gen_select_maintenance(
+    ast: exp.Select,
+    mv_fqn: str,
+    cursors_fqn: str,
+    mv_table: str,
+    src: dict[str, str],
+    dialect: str,
+) -> list[str]:
+    set_vars = _gen_set_snapshot_vars(src, cursors_fqn, mv_table)
+    changes_cte = _gen_changes_cte(src)
+    where_clause = _gen_where_clause(ast, dialect)
+
+    # Repoint projection columns to _delta
+    select_exprs = [sel.copy().transform(_repoint_columns_to_delta) for sel in ast.selects]
+    select_cols_sql = ", ".join(e.sql(dialect=dialect) for e in select_exprs)
+
+    # Output column names (for matching in DELETE)
+    out_col_names = _extract_output_col_names(ast)
+
+    # --- DELETE removed rows ---
+    all_proj_cols = ", ".join(out_col_names)
+
+    # Build join condition for ROW_NUMBER matching (handle NULLs with IS NOT DISTINCT FROM)
+    join_on_parts = [f"m.{c} IS NOT DISTINCT FROM d.{c}" for c in out_col_names]
+    join_on = " AND ".join(join_on_parts)
+
+    delete_sql = (
+        f"WITH {changes_cte},\n"
+        f"_deletes AS (\n"
+        f"    SELECT {select_cols_sql},\n"
+        f"           ROW_NUMBER() OVER (\n"
+        f"               PARTITION BY {all_proj_cols} ORDER BY (SELECT NULL)) AS _dn\n"
+        f"    FROM _changes AS _delta\n"
+        f"    WHERE _delta.change_type IN ('delete', 'update_preimage'){where_clause}\n"
+        f"),\n"
+        f"_mv_numbered AS (\n"
+        f"    SELECT rowid AS _rid, {all_proj_cols},\n"
+        f"           ROW_NUMBER() OVER (PARTITION BY {all_proj_cols} ORDER BY rowid) AS _mn\n"
+        f"    FROM {mv_fqn}\n"
+        f")\n"
+        f"DELETE FROM {mv_fqn}\n"
+        f"WHERE rowid IN (\n"
+        f"    SELECT _rid FROM _mv_numbered m\n"
+        f"    JOIN _deletes d ON {join_on} AND m._mn = d._dn\n"
+        f")"
+    )
+
+    # --- INSERT new rows ---
+    col_list = ", ".join(out_col_names)
+    insert_sql = (
+        f"WITH {changes_cte}\n"
+        f"INSERT INTO {mv_fqn} ({col_list})\n"
+        f"SELECT {select_cols_sql}\n"
+        f"FROM _changes AS _delta\n"
+        f"WHERE _delta.change_type IN ('insert', 'update_postimage'){where_clause}"
+    )
+
+    # --- Update cursor ---
+    update_cursor = _gen_update_cursor(cursors_fqn, mv_table, src)
+
+    return [*set_vars, delete_sql, insert_sql, update_cursor]
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Aggregate maintenance (GROUP BY + COUNT/SUM/AVG)
+# ---------------------------------------------------------------------------
+
+
+def _gen_aggregate_maintenance(
+    ast: exp.Select,
+    mv_fqn: str,
+    cursors_fqn: str,
+    mv_table: str,
+    src: dict[str, str],
+    dialect: str,
+    naming: Naming,
+) -> list[str]:
+    set_vars = _gen_set_snapshot_vars(src, cursors_fqn, mv_table)
+    changes_cte = _gen_changes_cte(src)
+    where_clause = _gen_where_clause(ast, dialect)
+
+    # Extract group columns and aggregate expressions
+    group_node = ast.args.get("group")
+    group_exprs = group_node.expressions if group_node else []
+    group_col_names = []
+    for g in group_exprs:
+        if isinstance(g, exp.Column):
+            group_col_names.append(g.name)
+        else:
+            group_col_names.append(g.sql(dialect=dialect))
+
+    # Analyze aggregates in the SELECT clause
+    agg_info = []  # list of (alias, agg_type, inner_col_name, is_avg)
+    for sel in ast.selects:
+        alias_name = sel.alias if isinstance(sel, exp.Alias) else None
+        inner = sel.this if isinstance(sel, exp.Alias) else sel
+        if isinstance(inner, exp.Sum):
+            col_name = inner.this.name if isinstance(inner.this, exp.Column) else inner.this.sql()
+            agg_info.append((alias_name or col_name, "SUM", col_name, False))
+        elif isinstance(inner, exp.Count):
+            # COUNT(*) or COUNT(col)
+            if isinstance(inner.this, exp.Star):
+                agg_info.append((alias_name or "count", "COUNT_STAR", None, False))
+            else:
+                col_name = (
+                    inner.this.name if isinstance(inner.this, exp.Column) else inner.this.sql()
+                )
+                agg_info.append((alias_name or col_name, "COUNT_COL", col_name, False))
+        elif isinstance(inner, exp.Avg):
+            col_name = inner.this.name if isinstance(inner.this, exp.Column) else inner.this.sql()
+            agg_info.append((alias_name or col_name, "AVG", col_name, True))
+
+    ivm_count_col = naming.aux_column("count")
+
+    # Build insert aggregate expressions for _ins and _del CTEs
+    ins_agg_parts = []
+    del_agg_parts = []
+    for alias, agg_type, col_name, _is_avg in agg_info:
+        if agg_type == "SUM":
+            ins_agg_parts.append(f"SUM(_delta.{col_name}) AS _ins_{alias}")
+            del_agg_parts.append(f"SUM(_delta.{col_name}) AS _del_{alias}")
+        elif agg_type == "COUNT_STAR":
+            ins_agg_parts.append(f"COUNT(*) AS _ins_{alias}")
+            del_agg_parts.append(f"COUNT(*) AS _del_{alias}")
+        elif agg_type == "COUNT_COL":
+            ins_agg_parts.append(f"COUNT(_delta.{col_name}) AS _ins_{alias}")
+            del_agg_parts.append(f"COUNT(_delta.{col_name}) AS _del_{alias}")
+        elif agg_type == "AVG":
+            sum_col = naming.aux_column(f"sum_{alias}")
+            ins_agg_parts.append(f"SUM(_delta.{col_name}) AS _ins_{sum_col}")
+            del_agg_parts.append(f"SUM(_delta.{col_name}) AS _del_{sum_col}")
+
+    ins_agg_parts.append("COUNT(*) AS _ins_cnt")
+    del_agg_parts.append("COUNT(*) AS _del_cnt")
+
+    ins_agg_sql = ", ".join(ins_agg_parts)
+    del_agg_sql = ", ".join(del_agg_parts)
+
+    # Repoint group column references to _delta
+    delta_group_cols = ", ".join(f"_delta.{g}" for g in group_col_names)
+
+    # Build COALESCE for the FULL OUTER JOIN select
+    coalesce_group = ", ".join(f"COALESCE(i.{g}, d.{g}) AS {g}" for g in group_col_names)
+
+    # Build net delta expressions
+    net_parts = []
+    for alias, agg_type, _col_name, _is_avg in agg_info:
+        if agg_type in ("SUM", "COUNT_STAR", "COUNT_COL"):
+            net_parts.append(
+                f"COALESCE(i._ins_{alias}, 0) - COALESCE(d._del_{alias}, 0) AS _net_{alias}"
+            )
+        elif agg_type == "AVG":
+            sum_col = naming.aux_column(f"sum_{alias}")
+            net_parts.append(
+                f"COALESCE(i._ins_{sum_col}, 0) - COALESCE(d._del_{sum_col}, 0) AS _net_{sum_col}"
+            )
+    net_parts.append("COALESCE(i._ins_cnt, 0) - COALESCE(d._del_cnt, 0) AS _net_count")
+    net_sql = ", ".join(net_parts)
+
+    # Join condition for FULL OUTER JOIN
+    join_cond = " AND ".join(f"i.{g} IS NOT DISTINCT FROM d.{g}" for g in group_col_names)
+
+    # Step 1: Create temp table with net delta aggregates
+    create_delta_agg = (
+        f"CREATE TEMP TABLE _delta_agg AS\n"
+        f"WITH {changes_cte},\n"
+        f"_ins AS (\n"
+        f"    SELECT {delta_group_cols}, {ins_agg_sql}\n"
+        f"    FROM _changes AS _delta\n"
+        f"    WHERE _delta.change_type IN ('insert', 'update_postimage'){where_clause}\n"
+        f"    GROUP BY {delta_group_cols}\n"
+        f"),\n"
+        f"_del AS (\n"
+        f"    SELECT {delta_group_cols}, {del_agg_sql}\n"
+        f"    FROM _changes AS _delta\n"
+        f"    WHERE _delta.change_type IN ('delete', 'update_preimage'){where_clause}\n"
+        f"    GROUP BY {delta_group_cols}\n"
+        f")\n"
+        f"SELECT {coalesce_group}, {net_sql}\n"
+        f"FROM _ins i FULL OUTER JOIN _del d ON {join_cond}"
+    )
+
+    # Step 2: Update existing groups
+    update_sets = []
+    for alias, agg_type, _col_name, _is_avg in agg_info:
+        if agg_type in ("SUM", "COUNT_STAR", "COUNT_COL"):
+            update_sets.append(f"{alias} = mv.{alias} + d._net_{alias}")
+        elif agg_type == "AVG":
+            sum_col = naming.aux_column(f"sum_{alias}")
+            update_sets.append(f"{sum_col} = mv.{sum_col} + d._net_{sum_col}")
+            # Recompute AVG from updated sum/count
+            update_sets.append(
+                f"{alias} = CAST(mv.{sum_col} + d._net_{sum_col} AS DOUBLE) "
+                f"/ (mv.{ivm_count_col} + d._net_count)"
+            )
+    update_sets.append(f"{ivm_count_col} = mv.{ivm_count_col} + d._net_count")
+    update_sets_sql = ", ".join(update_sets)
+
+    update_where = " AND ".join(f"mv.{g} IS NOT DISTINCT FROM d.{g}" for g in group_col_names)
+
+    update_existing = (
+        f"UPDATE {mv_fqn} AS mv\nSET {update_sets_sql}\nFROM _delta_agg d\nWHERE {update_where}"
+    )
+
+    # Step 3: Insert new groups
+    insert_cols = list(group_col_names)
+    insert_vals = [f"d.{g}" for g in group_col_names]
+    for alias, agg_type, _col_name, _is_avg in agg_info:
+        if agg_type in ("SUM", "COUNT_STAR", "COUNT_COL"):
+            insert_cols.append(alias)
+            insert_vals.append(f"d._net_{alias}")
+        elif agg_type == "AVG":
+            sum_col = naming.aux_column(f"sum_{alias}")
+            insert_cols.append(sum_col)
+            insert_vals.append(f"d._net_{sum_col}")
+            insert_cols.append(alias)
+            insert_vals.append(f"CAST(d._net_{sum_col} AS DOUBLE) / d._net_count")
+    insert_cols.append(ivm_count_col)
+    insert_vals.append("d._net_count")
+
+    not_exists_where = " AND ".join(f"mv.{g} IS NOT DISTINCT FROM d.{g}" for g in group_col_names)
+
+    insert_new = (
+        f"INSERT INTO {mv_fqn} ({', '.join(insert_cols)})\n"
+        f"SELECT {', '.join(insert_vals)}\n"
+        f"FROM _delta_agg d\n"
+        f"WHERE NOT EXISTS (\n"
+        f"    SELECT 1 FROM {mv_fqn} mv WHERE {not_exists_where}\n"
+        f")\n"
+        f"AND d._net_count > 0"
+    )
+
+    # Step 4: Delete emptied groups
+    delete_empty = f"DELETE FROM {mv_fqn} WHERE {ivm_count_col} <= 0"
+
+    # Step 5: Cleanup + update cursor
+    drop_delta = "DROP TABLE IF EXISTS _delta_agg"
+    update_cursor = _gen_update_cursor(cursors_fqn, mv_table, src)
+
+    return [
+        *set_vars,
+        create_delta_agg,
+        update_existing,
+        insert_new,
+        delete_empty,
+        drop_delta,
+        update_cursor,
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _gen_update_cursor(cursors_fqn: str, mv_table: str, src: dict[str, str]) -> str:
+    return (
+        f"UPDATE {cursors_fqn}\n"
+        f"SET last_snapshot = (\n"
+        f"    SELECT MAX(snapshot_id) FROM ducklake_snapshots('{src['catalog']}'))\n"
+        f"WHERE mv_name = '{mv_table}' AND source_catalog = '{src['catalog']}'"
+    )
+
+
+def _detect_features(ast: exp.Select) -> set[str]:
+    features: set[str] = {"select"}
+    if ast.args.get("where"):
+        features.add("where")
+    if ast.args.get("group"):
+        features.add("group_by")
+    for agg in ast.find_all(exp.AggFunc):
+        if isinstance(agg, exp.Sum):
+            features.add("sum")
+        elif isinstance(agg, exp.Count):
+            features.add("count")
+        elif isinstance(agg, exp.Avg):
+            features.add("avg")
+    return features

@@ -9,26 +9,49 @@ All base tables live in a DuckLake catalog. Deltas are read via
 ducklake_table_changes() — no manually-populated delta tables.
 """
 
-import duckdb
-import pytest
-from hypothesis import given, settings, HealthCheck
+import os
+import shutil
+import tempfile
 
+import duckdb
+from hypothesis import HealthCheck, given, settings
+
+from ducklake_ivm import compile_ivm
+from tests.conftest import DUCKLAKE_CATALOG
 from tests.strategies import (
     Column,
     Delta,
-    Scenario,
     Row,
+    Scenario,
     Table,
-    single_table_select,
     single_table_aggregate,
+    single_table_select,
 )
-from tests.conftest import DUCKLAKE_CATALOG
-from ducklake_ivm.compiler import compile_ivm
+
+
+def make_ducklake():
+    """Create a fresh isolated DuckLake instance. Returns (con, catalog, cleanup_fn)."""
+    tmpdir = tempfile.mkdtemp()
+    meta_path = os.path.join(tmpdir, "meta.ddb")
+    data_path = os.path.join(tmpdir, "data")
+    os.makedirs(data_path, exist_ok=True)
+
+    con = duckdb.connect()
+    con.execute("INSTALL ducklake")
+    con.execute("LOAD ducklake")
+    con.execute(f"ATTACH 'ducklake:{meta_path}' AS {DUCKLAKE_CATALOG} (DATA_PATH '{data_path}')")
+
+    def cleanup():
+        con.close()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return con, DUCKLAKE_CATALOG, cleanup
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def sql_literal(value: object) -> str:
     """Convert a Python value to a SQL literal."""
@@ -70,7 +93,7 @@ def delete_rows(
         return
     for row in rows:
         conditions = " AND ".join(
-            f"{c} = {sql_literal(row.values[c])}" for c in table.col_names
+            f"{c} IS NOT DISTINCT FROM {sql_literal(row.values[c])}" for c in table.col_names
         )
         # Delete only one matching row
         con.execute(f"""
@@ -82,13 +105,6 @@ def delete_rows(
         """)
 
 
-def get_snapshot(con: duckdb.DuckDBPyConnection, catalog: str) -> int:
-    """Get the current (latest) snapshot ID for the DuckLake catalog."""
-    return con.execute(
-        f"SELECT MAX(snapshot_id) FROM ducklake_snapshots({catalog})"
-    ).fetchone()[0]
-
-
 def setup_scenario(
     con: duckdb.DuckDBPyConnection,
     scenario: Scenario,
@@ -98,18 +114,6 @@ def setup_scenario(
     for table in scenario.tables:
         con.execute(table.ddl(catalog))
         insert_rows(con, table, scenario.initial_data.get(table.name, []), catalog)
-
-
-def qualified_view_sql(view_sql: str, catalog: str) -> str:
-    """Qualify unqualified table names in the view SQL with the catalog.
-
-    Simple prefix replacement — works for our generated scenarios where
-    table names appear after FROM/JOIN keywords.
-    """
-    # For now, use DuckDB's USE to set the default catalog so that
-    # unqualified names resolve to DuckLake tables.
-    # The view_sql stays unqualified; the caller sets USE before executing.
-    return view_sql
 
 
 def recompute_view(
@@ -137,9 +141,19 @@ def apply_deltas(
         insert_rows(con, table, delta.inserts, catalog)
 
 
-def read_mv(con: duckdb.DuckDBPyConnection, mv_table: str = "mv") -> list[tuple]:
-    """Read the materialized view table (in memory catalog) and return sorted results."""
-    result = con.execute(f"SELECT * FROM memory.main.{mv_table}").fetchall()
+def read_mv(
+    con: duckdb.DuckDBPyConnection,
+    mv_fqn: str,
+) -> list[tuple]:
+    """Read the MV, excluding _ivm_* auxiliary columns, return sorted results."""
+    # Get column names
+    result = con.execute(f"SELECT * FROM {mv_fqn} LIMIT 0")
+    all_cols = [desc[0] for desc in result.description]
+    visible_cols = [c for c in all_cols if not c.startswith("_ivm_")]
+    if not visible_cols:
+        return []
+    cols_sql = ", ".join(visible_cols)
+    result = con.execute(f"SELECT {cols_sql} FROM {mv_fqn}").fetchall()
     return sorted(result)
 
 
@@ -147,60 +161,47 @@ def read_mv(con: duckdb.DuckDBPyConnection, mv_table: str = "mv") -> list[tuple]
 # The core oracle test
 # ---------------------------------------------------------------------------
 
-def assert_ivm_correct(scenario: Scenario, ducklake_fixture):
-    """The core correctness check: maintained MV == recomputed view.
 
-    Steps:
-        1. Create DuckLake tables with initial data
-        2. Record the snapshot after initial data load
-        3. Compile IVM maintenance SQL from the view definition
-        4. Materialize the view (full computation into memory.main.mv)
-        5. Apply deltas to the DuckLake base tables
-        6. Record the post-delta snapshot
-        7. Run the compiler's maintenance SQL (reads ducklake_table_changes)
-        8. Recompute the view from scratch on the updated tables
-        9. Assert: maintained MV == recomputed view
-    """
+def assert_ivm_correct(scenario: Scenario, ducklake_fixture):
+    """The core correctness check: maintained MV == recomputed view."""
     con, catalog = ducklake_fixture
 
     # 1. Set up DuckLake tables with initial data
     setup_scenario(con, scenario, catalog)
 
-    # 2. Record snapshot after initial data
-    pre_snapshot = get_snapshot(con, catalog)
+    # 2. Compile IVM
+    plan = compile_ivm(
+        scenario.view_sql,
+        dialect="duckdb",
+        mv_catalog=catalog,
+    )
 
-    # 3. Compile IVM
-    ivm_output = compile_ivm(scenario.view_sql, dialect="duckdb")
-
-    # 4. Initial materialization into memory catalog
-    con.execute(f"USE {catalog}")
-    con.execute(f"CREATE TABLE memory.main.mv AS {scenario.view_sql}")
-    con.execute("USE memory")
-
-    # 5. Apply deltas to DuckLake base tables
-    apply_deltas(con, scenario, catalog)
-
-    # 6. Record post-delta snapshot
-    post_snapshot = get_snapshot(con, catalog)
-
-    # 7. Run maintenance SQL
-    #    The compiler's maintain statements will reference
-    #    ducklake_table_changes() with the snapshot range.
-    for stmt in ivm_output.maintain:
+    # 3. Set up MV and cursors
+    con.execute(plan.create_cursors_table)
+    con.execute(plan.create_mv)
+    for stmt in plan.initialize_cursors:
         con.execute(stmt)
 
-    # 8. Read maintained MV
-    maintained = read_mv(con)
+    # 4. Apply deltas to DuckLake base tables
+    apply_deltas(con, scenario, catalog)
 
-    # 9. Recompute from scratch and compare
+    # 5. Run maintenance SQL
+    for stmt in plan.maintain:
+        con.execute(stmt)
+
+    # 6. Read maintained MV (excluding _ivm_* columns)
+    mv_fqn = f"{catalog}.main.mv"
+    maintained = read_mv(con, mv_fqn)
+
+    # 7. Recompute from scratch and compare
     expected = recompute_view(con, scenario.view_sql, catalog)
 
     assert maintained == expected, (
         f"IVM result differs from recomputation.\n"
         f"View: {scenario.view_sql}\n"
-        f"Snapshots: {pre_snapshot} -> {post_snapshot}\n"
-        f"Maintained: {maintained}\n"
-        f"Expected:   {expected}"
+        f"Maintained ({len(maintained)} rows): {maintained}\n"
+        f"Expected ({len(expected)} rows):   {expected}\n"
+        f"Plan maintain SQL:\n" + "\n---\n".join(plan.maintain)
     )
 
 
@@ -208,15 +209,20 @@ def assert_ivm_correct(scenario: Scenario, ducklake_fixture):
 # Property tests
 # ---------------------------------------------------------------------------
 
+
 @given(scenario=single_table_select())
 @settings(
     max_examples=50,
     suppress_health_check=[HealthCheck.too_slow],
     deadline=None,
 )
-def test_select_project_filter(scenario, ducklake):
+def test_select_project_filter(scenario):
     """SELECT/PROJECT/WHERE on a single table maintains correctly."""
-    assert_ivm_correct(scenario, ducklake)
+    con, catalog, cleanup = make_ducklake()
+    try:
+        assert_ivm_correct(scenario, (con, catalog))
+    finally:
+        cleanup()
 
 
 @given(scenario=single_table_aggregate())
@@ -225,14 +231,19 @@ def test_select_project_filter(scenario, ducklake):
     suppress_health_check=[HealthCheck.too_slow],
     deadline=None,
 )
-def test_single_table_aggregate(scenario, ducklake):
+def test_single_table_aggregate(scenario):
     """GROUP BY with SUM/COUNT/AVG on a single table maintains correctly."""
-    assert_ivm_correct(scenario, ducklake)
+    con, catalog, cleanup = make_ducklake()
+    try:
+        assert_ivm_correct(scenario, (con, catalog))
+    finally:
+        cleanup()
 
 
 # ---------------------------------------------------------------------------
 # Deterministic smoke tests
 # ---------------------------------------------------------------------------
+
 
 class TestSmoke:
     """Hand-written scenarios to sanity-check the oracle harness."""
@@ -240,63 +251,83 @@ class TestSmoke:
     def test_simple_select_all(self, ducklake):
         scenario = Scenario(
             tables=[Table("t", [Column("id", "INTEGER"), Column("val", "INTEGER")])],
-            initial_data={"t": [
-                Row({"id": 1, "val": 10}),
-                Row({"id": 2, "val": 20}),
-                Row({"id": 3, "val": 30}),
-            ]},
+            initial_data={
+                "t": [
+                    Row({"id": 1, "val": 10}),
+                    Row({"id": 2, "val": 20}),
+                    Row({"id": 3, "val": 30}),
+                ]
+            },
             view_sql="SELECT id, val FROM t",
-            deltas=[Delta("t",
-                inserts=[Row({"id": 4, "val": 40})],
-                deletes=[Row({"id": 2, "val": 20})],
-            )],
+            deltas=[
+                Delta(
+                    "t",
+                    inserts=[Row({"id": 4, "val": 40})],
+                    deletes=[Row({"id": 2, "val": 20})],
+                )
+            ],
         )
         assert_ivm_correct(scenario, ducklake)
 
     def test_select_with_filter(self, ducklake):
         scenario = Scenario(
             tables=[Table("t", [Column("id", "INTEGER"), Column("val", "INTEGER")])],
-            initial_data={"t": [
-                Row({"id": 1, "val": 10}),
-                Row({"id": 2, "val": 20}),
-                Row({"id": 3, "val": 30}),
-            ]},
+            initial_data={
+                "t": [
+                    Row({"id": 1, "val": 10}),
+                    Row({"id": 2, "val": 20}),
+                    Row({"id": 3, "val": 30}),
+                ]
+            },
             view_sql="SELECT id, val FROM t WHERE val > 15",
-            deltas=[Delta("t",
-                inserts=[Row({"id": 4, "val": 5}), Row({"id": 5, "val": 50})],
-                deletes=[Row({"id": 3, "val": 30})],
-            )],
+            deltas=[
+                Delta(
+                    "t",
+                    inserts=[Row({"id": 4, "val": 5}), Row({"id": 5, "val": 50})],
+                    deletes=[Row({"id": 3, "val": 30})],
+                )
+            ],
         )
         assert_ivm_correct(scenario, ducklake)
 
     def test_count_aggregate(self, ducklake):
         scenario = Scenario(
             tables=[Table("t", [Column("grp", "VARCHAR"), Column("val", "INTEGER")])],
-            initial_data={"t": [
-                Row({"grp": "a", "val": 1}),
-                Row({"grp": "a", "val": 2}),
-                Row({"grp": "b", "val": 3}),
-            ]},
+            initial_data={
+                "t": [
+                    Row({"grp": "a", "val": 1}),
+                    Row({"grp": "a", "val": 2}),
+                    Row({"grp": "b", "val": 3}),
+                ]
+            },
             view_sql="SELECT grp, COUNT(*) AS agg_val FROM t GROUP BY grp",
-            deltas=[Delta("t",
-                inserts=[Row({"grp": "a", "val": 10}), Row({"grp": "c", "val": 5})],
-                deletes=[Row({"grp": "b", "val": 3})],
-            )],
+            deltas=[
+                Delta(
+                    "t",
+                    inserts=[Row({"grp": "a", "val": 10}), Row({"grp": "c", "val": 5})],
+                    deletes=[Row({"grp": "b", "val": 3})],
+                )
+            ],
         )
         assert_ivm_correct(scenario, ducklake)
 
     def test_sum_aggregate(self, ducklake):
         scenario = Scenario(
             tables=[Table("t", [Column("grp", "VARCHAR"), Column("val", "INTEGER")])],
-            initial_data={"t": [
-                Row({"grp": "a", "val": 10}),
-                Row({"grp": "a", "val": 20}),
-                Row({"grp": "b", "val": 30}),
-            ]},
+            initial_data={
+                "t": [
+                    Row({"grp": "a", "val": 10}),
+                    Row({"grp": "a", "val": 20}),
+                    Row({"grp": "b", "val": 30}),
+                ]
+            },
             view_sql="SELECT grp, SUM(val) AS agg_val FROM t GROUP BY grp",
-            deltas=[Delta("t",
-                inserts=[Row({"grp": "a", "val": 5})],
-                deletes=[Row({"grp": "a", "val": 10})],
-            )],
+            deltas=[
+                Delta(
+                    "t",
+                    inserts=[Row({"grp": "a", "val": 5})],
+                    deletes=[Row({"grp": "a", "val": 10})],
+                )
+            ],
         )
         assert_ivm_correct(scenario, ducklake)

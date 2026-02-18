@@ -5,7 +5,6 @@ import tempfile
 import duckdb
 import pytest
 
-
 DUCKLAKE_CATALOG = "dl"
 
 
@@ -27,10 +26,7 @@ def ducklake():
     con = duckdb.connect()
     con.execute("INSTALL ducklake")
     con.execute("LOAD ducklake")
-    con.execute(
-        f"ATTACH 'ducklake:{meta_path}' AS {DUCKLAKE_CATALOG} "
-        f"(DATA_PATH '{data_path}')"
-    )
+    con.execute(f"ATTACH 'ducklake:{meta_path}' AS {DUCKLAKE_CATALOG} (DATA_PATH '{data_path}')")
 
     yield con, DUCKLAKE_CATALOG
 
