@@ -26,6 +26,7 @@ from tests.strategies import (
     Table,
     single_table_aggregate,
     single_table_select,
+    two_table_join,
 )
 
 
@@ -240,6 +241,21 @@ def test_single_table_aggregate(scenario):
         cleanup()
 
 
+@given(scenario=two_table_join())
+@settings(
+    max_examples=50,
+    suppress_health_check=[HealthCheck.too_slow],
+    deadline=None,
+)
+def test_two_table_join(scenario):
+    """Two-table inner JOIN maintains correctly."""
+    con, catalog, cleanup = make_ducklake()
+    try:
+        assert_ivm_correct(scenario, (con, catalog))
+    finally:
+        cleanup()
+
+
 # ---------------------------------------------------------------------------
 # Deterministic smoke tests
 # ---------------------------------------------------------------------------
@@ -328,6 +344,142 @@ class TestSmoke:
                     inserts=[Row({"grp": "a", "val": 5})],
                     deletes=[Row({"grp": "a", "val": 10})],
                 )
+            ],
+        )
+        assert_ivm_correct(scenario, ducklake)
+
+    def test_join_insert_left_only(self, ducklake):
+        """Inner join: insert into left table only -> new matches appear."""
+        left = Table("orders", [Column("oid", "INTEGER"), Column("cid", "INTEGER")])
+        right = Table("customers", [Column("cid", "INTEGER"), Column("name", "VARCHAR")])
+        scenario = Scenario(
+            tables=[left, right],
+            initial_data={
+                "orders": [
+                    Row({"oid": 1, "cid": 1}),
+                    Row({"oid": 2, "cid": 2}),
+                ],
+                "customers": [
+                    Row({"cid": 1, "name": "alice"}),
+                    Row({"cid": 2, "name": "bob"}),
+                ],
+            },
+            view_sql=(
+                "SELECT orders.oid, orders.cid, customers.name"
+                " FROM orders JOIN customers ON orders.cid = customers.cid"
+            ),
+            deltas=[
+                Delta("orders", inserts=[Row({"oid": 3, "cid": 1})], deletes=[]),
+            ],
+        )
+        assert_ivm_correct(scenario, ducklake)
+
+    def test_join_insert_right_only(self, ducklake):
+        """Inner join: insert into right table only -> new matches appear."""
+        left = Table("orders", [Column("oid", "INTEGER"), Column("cid", "INTEGER")])
+        right = Table("customers", [Column("cid", "INTEGER"), Column("name", "VARCHAR")])
+        scenario = Scenario(
+            tables=[left, right],
+            initial_data={
+                "orders": [
+                    Row({"oid": 1, "cid": 1}),
+                    Row({"oid": 2, "cid": 2}),
+                ],
+                "customers": [
+                    Row({"cid": 1, "name": "alice"}),
+                    Row({"cid": 2, "name": "bob"}),
+                ],
+            },
+            view_sql=(
+                "SELECT orders.oid, orders.cid, customers.name"
+                " FROM orders JOIN customers ON orders.cid = customers.cid"
+            ),
+            deltas=[
+                Delta("customers", inserts=[Row({"cid": 3, "name": "carol"})], deletes=[]),
+            ],
+        )
+        assert_ivm_correct(scenario, ducklake)
+
+    def test_join_insert_both(self, ducklake):
+        """Inner join: insert into both tables -> cross-delta term exercised."""
+        left = Table("orders", [Column("oid", "INTEGER"), Column("cid", "INTEGER")])
+        right = Table("customers", [Column("cid", "INTEGER"), Column("name", "VARCHAR")])
+        scenario = Scenario(
+            tables=[left, right],
+            initial_data={
+                "orders": [
+                    Row({"oid": 1, "cid": 1}),
+                ],
+                "customers": [
+                    Row({"cid": 1, "name": "alice"}),
+                ],
+            },
+            view_sql=(
+                "SELECT orders.oid, orders.cid, customers.name"
+                " FROM orders JOIN customers ON orders.cid = customers.cid"
+            ),
+            deltas=[
+                Delta("orders", inserts=[Row({"oid": 2, "cid": 3})], deletes=[]),
+                Delta("customers", inserts=[Row({"cid": 3, "name": "carol"})], deletes=[]),
+            ],
+        )
+        assert_ivm_correct(scenario, ducklake)
+
+    def test_join_delete_participant(self, ducklake):
+        """Inner join: delete row that participates in join -> matches removed."""
+        left = Table("orders", [Column("oid", "INTEGER"), Column("cid", "INTEGER")])
+        right = Table("customers", [Column("cid", "INTEGER"), Column("name", "VARCHAR")])
+        scenario = Scenario(
+            tables=[left, right],
+            initial_data={
+                "orders": [
+                    Row({"oid": 1, "cid": 1}),
+                    Row({"oid": 2, "cid": 2}),
+                ],
+                "customers": [
+                    Row({"cid": 1, "name": "alice"}),
+                    Row({"cid": 2, "name": "bob"}),
+                ],
+            },
+            view_sql=(
+                "SELECT orders.oid, orders.cid, customers.name"
+                " FROM orders JOIN customers ON orders.cid = customers.cid"
+            ),
+            deltas=[
+                Delta(
+                    "orders",
+                    inserts=[],
+                    deletes=[Row({"oid": 1, "cid": 1})],
+                ),
+            ],
+        )
+        assert_ivm_correct(scenario, ducklake)
+
+    def test_join_delete_nonparticipant(self, ducklake):
+        """Inner join: delete row that doesn't participate -> MV unchanged."""
+        left = Table("orders", [Column("oid", "INTEGER"), Column("cid", "INTEGER")])
+        right = Table("customers", [Column("cid", "INTEGER"), Column("name", "VARCHAR")])
+        scenario = Scenario(
+            tables=[left, right],
+            initial_data={
+                "orders": [
+                    Row({"oid": 1, "cid": 1}),
+                    Row({"oid": 2, "cid": 99}),
+                ],
+                "customers": [
+                    Row({"cid": 1, "name": "alice"}),
+                ],
+            },
+            view_sql=(
+                "SELECT orders.oid, orders.cid, customers.name"
+                " FROM orders JOIN customers ON orders.cid = customers.cid"
+            ),
+            deltas=[
+                Delta(
+                    "orders",
+                    inserts=[],
+                    deletes=[Row({"oid": 2, "cid": 99})],
+                ),
             ],
         )
         assert_ivm_correct(scenario, ducklake)

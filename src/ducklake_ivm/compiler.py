@@ -31,18 +31,11 @@ def compile_ivm(
     # --- Analysis ---
     tables = list(ast.find_all(exp.Table))
     has_agg = bool(list(ast.find_all(exp.AggFunc)))
-    has_join = bool(ast.args.get("joins"))
-
-    if has_join:
-        raise UnsupportedSQLError("join", "Joins not yet supported")
+    joins = ast.args.get("joins")
+    has_join = bool(joins)
 
     if not tables:
         raise UnsupportedSQLError("no_table", "No tables found in view SQL")
-
-    # --- Resolve source ---
-    table = tables[0]
-    table_name = table.name
-    src = _resolve_source(table_name, sources, mv_catalog, mv_schema)
 
     mv_table = naming.mv_table()
     mv_fqn = f"{mv_catalog}.{mv_schema}.{mv_table}"
@@ -50,6 +43,31 @@ def compile_ivm(
 
     # --- Generate SQL ---
     create_cursors = _gen_create_cursors(cursors_fqn)
+
+    if has_join:
+        if has_agg:
+            raise UnsupportedSQLError("join_aggregate", "JOIN + aggregates not yet supported")
+        assert joins is not None
+        return _compile_join(
+            ast,
+            tables,
+            joins,
+            dialect,
+            naming,
+            sources,
+            mv_catalog,
+            mv_schema,
+            mv_table,
+            mv_fqn,
+            cursors_fqn,
+            create_cursors,
+        )
+
+    # --- Single table path ---
+    table = tables[0]
+    table_name = table.name
+    src = _resolve_source(table_name, sources, mv_catalog, mv_schema)
+
     create_mv = _gen_create_mv(ast, mv_fqn, src, dialect, has_agg, naming)
     init_cursors = [_gen_init_cursor(cursors_fqn, mv_table, src)]
 
@@ -138,11 +156,8 @@ def _gen_create_mv(
             alias_name = sel.alias if isinstance(sel, exp.Alias) else None
             inner = sel.this if isinstance(sel, exp.Alias) else sel
             if isinstance(inner, exp.Avg):
-                # Replace AVG(x) with SUM(x) as _ivm_sum_<alias>, keep alias for computed col
                 sum_col = naming.aux_column(f"sum_{alias_name or 'val'}")
                 new_selects.append(exp.alias_(exp.Sum(this=inner.this.copy()), sum_col))
-                # The actual AVG column will be computed as _ivm_sum / _ivm_count
-                # We store it as the user-facing alias
                 new_selects.append(
                     exp.alias_(
                         exp.Div(
@@ -157,16 +172,35 @@ def _gen_create_mv(
                 )
             else:
                 new_selects.append(sel)
-        # Re-add the _ivm_count (it was already appended above, so we need to handle carefully)
-        # Actually let's rebuild: remove old selects, add new ones + _ivm_count
         qualified_ast.args["expressions"] = new_selects
-        # Check if _ivm_count already added (it was appended to original expressions)
         has_ivm_count = any(
             (isinstance(s, exp.Alias) and s.alias == count_alias) for s in qualified_ast.selects
         )
         if not has_ivm_count:
             qualified_ast.args["expressions"].append(count_expr)
 
+    return f"CREATE TABLE {mv_fqn} AS {qualified_ast.sql(dialect=dialect)}"
+
+
+def _gen_create_mv_join(
+    ast: exp.Select,
+    mv_fqn: str,
+    table_sources: dict[str, dict[str, str]],
+    dialect: str,
+) -> str:
+    """Generate CREATE TABLE AS for a join view, qualifying all table refs."""
+    qualified_ast: exp.Select = ast.copy().transform(  # type: ignore[assignment]
+        lambda node: (
+            exp.table_(
+                node.name,
+                db=table_sources[node.name]["schema"],
+                catalog=table_sources[node.name]["catalog"],
+                alias=node.alias_or_name,
+            )
+            if isinstance(node, exp.Table) and node.name in table_sources
+            else node
+        )
+    )
     return f"CREATE TABLE {mv_fqn} AS {qualified_ast.sql(dialect=dialect)}"
 
 
@@ -191,28 +225,14 @@ def _repoint_columns_to_delta(node: exp.Expression) -> exp.Expression:
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: SELECT / PROJECT / WHERE maintenance
+# Snapshot variable helpers
 # ---------------------------------------------------------------------------
-
-
-def _extract_output_col_names(ast: exp.Select) -> list[str]:
-    """Get the output column names from the SELECT clause."""
-    names = []
-    for sel in ast.selects:
-        if isinstance(sel, exp.Alias):
-            names.append(sel.alias)
-        elif isinstance(sel, exp.Column):
-            names.append(sel.name)
-        else:
-            names.append(sel.sql())
-    return names
 
 
 def _gen_set_snapshot_vars(src: dict[str, str], cursors_fqn: str, mv_table: str) -> list[str]:
     """Generate SET VARIABLE statements to capture snapshot range.
 
-    DuckDB doesn't allow subqueries inside table function arguments,
-    so we capture the values into variables first.
+    DuckDB table functions cannot contain subqueries, so we capture values first.
     """
     return [
         (
@@ -229,11 +249,29 @@ def _gen_set_snapshot_vars(src: dict[str, str], cursors_fqn: str, mv_table: str)
     ]
 
 
-def _gen_changes_cte(src: dict[str, str]) -> str:
-    """Generate the _changes CTE that reads ducklake_table_changes().
+def _gen_set_snapshot_vars_named(
+    src: dict[str, str], cursors_fqn: str, mv_table: str, suffix: str
+) -> list[str]:
+    """Like _gen_set_snapshot_vars but with a named suffix for multi-table cases."""
+    return [
+        (
+            f"SET VARIABLE _ivm_snap_start_{suffix} = (\n"
+            f"    SELECT last_snapshot + 1 FROM {cursors_fqn}\n"
+            f"    WHERE mv_name = '{mv_table}'"
+            f" AND source_catalog = '{src['catalog']}'\n"
+            f")"
+        ),
+        (
+            f"SET VARIABLE _ivm_snap_end_{suffix} = (\n"
+            f"    SELECT MAX(snapshot_id)"
+            f" FROM ducklake_snapshots('{src['catalog']}')\n"
+            f")"
+        ),
+    ]
 
-    Assumes _ivm_snap_start and _ivm_snap_end variables have been set.
-    """
+
+def _gen_changes_cte(src: dict[str, str]) -> str:
+    """Generate the _changes CTE. Assumes _ivm_snap_start/_end are set."""
     return (
         f"_changes AS (\n"
         f"    SELECT * FROM ducklake_table_changes(\n"
@@ -243,6 +281,37 @@ def _gen_changes_cte(src: dict[str, str]) -> str:
         f"    )\n"
         f")"
     )
+
+
+def _gen_changes_cte_named(src: dict[str, str], cte_name: str, suffix: str) -> str:
+    """Generate a named changes CTE for multi-table join cases."""
+    return (
+        f"{cte_name} AS (\n"
+        f"    SELECT * FROM ducklake_table_changes(\n"
+        f"        '{src['catalog']}', '{src['schema']}', '{src['table']}',\n"
+        f"        getvariable('_ivm_snap_start_{suffix}'),\n"
+        f"        getvariable('_ivm_snap_end_{suffix}')\n"
+        f"    )\n"
+        f")"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: SELECT / PROJECT / WHERE maintenance
+# ---------------------------------------------------------------------------
+
+
+def _extract_output_col_names(ast: exp.Select) -> list[str]:
+    """Get the output column names from the SELECT clause."""
+    names = []
+    for sel in ast.selects:
+        if isinstance(sel, exp.Alias):
+            names.append(sel.alias)
+        elif isinstance(sel, exp.Column):
+            names.append(sel.name)
+        else:
+            names.append(sel.sql())
+    return names
 
 
 def _gen_where_clause(ast: exp.Select, dialect: str) -> str:
@@ -276,7 +345,7 @@ def _gen_select_maintenance(
     # --- DELETE removed rows ---
     all_proj_cols = ", ".join(out_col_names)
 
-    # Build join condition for ROW_NUMBER matching (handle NULLs with IS NOT DISTINCT FROM)
+    # Build join condition for ROW_NUMBER matching (handle NULLs)
     join_on_parts = [f"m.{c} IS NOT DISTINCT FROM d.{c}" for c in out_col_names]
     join_on = " AND ".join(join_on_parts)
 
@@ -285,13 +354,16 @@ def _gen_select_maintenance(
         f"_deletes AS (\n"
         f"    SELECT {select_cols_sql},\n"
         f"           ROW_NUMBER() OVER (\n"
-        f"               PARTITION BY {all_proj_cols} ORDER BY (SELECT NULL)) AS _dn\n"
+        f"               PARTITION BY {all_proj_cols}"
+        f" ORDER BY (SELECT NULL)) AS _dn\n"
         f"    FROM _changes AS _delta\n"
-        f"    WHERE _delta.change_type IN ('delete', 'update_preimage'){where_clause}\n"
+        f"    WHERE _delta.change_type"
+        f" IN ('delete', 'update_preimage'){where_clause}\n"
         f"),\n"
         f"_mv_numbered AS (\n"
         f"    SELECT rowid AS _rid, {all_proj_cols},\n"
-        f"           ROW_NUMBER() OVER (PARTITION BY {all_proj_cols} ORDER BY rowid) AS _mn\n"
+        f"           ROW_NUMBER() OVER ("
+        f"PARTITION BY {all_proj_cols} ORDER BY rowid) AS _mn\n"
         f"    FROM {mv_fqn}\n"
         f")\n"
         f"DELETE FROM {mv_fqn}\n"
@@ -308,7 +380,8 @@ def _gen_select_maintenance(
         f"INSERT INTO {mv_fqn} ({col_list})\n"
         f"SELECT {select_cols_sql}\n"
         f"FROM _changes AS _delta\n"
-        f"WHERE _delta.change_type IN ('insert', 'update_postimage'){where_clause}"
+        f"WHERE _delta.change_type"
+        f" IN ('insert', 'update_postimage'){where_clause}"
     )
 
     # --- Update cursor ---
@@ -354,7 +427,6 @@ def _gen_aggregate_maintenance(
             col_name = inner.this.name if isinstance(inner.this, exp.Column) else inner.this.sql()
             agg_info.append((alias_name or col_name, "SUM", col_name, False))
         elif isinstance(inner, exp.Count):
-            # COUNT(*) or COUNT(col)
             if isinstance(inner.this, exp.Star):
                 agg_info.append((alias_name or "count", "COUNT_STAR", None, False))
             else:
@@ -423,13 +495,15 @@ def _gen_aggregate_maintenance(
         f"_ins AS (\n"
         f"    SELECT {delta_group_cols}, {ins_agg_sql}\n"
         f"    FROM _changes AS _delta\n"
-        f"    WHERE _delta.change_type IN ('insert', 'update_postimage'){where_clause}\n"
+        f"    WHERE _delta.change_type"
+        f" IN ('insert', 'update_postimage'){where_clause}\n"
         f"    GROUP BY {delta_group_cols}\n"
         f"),\n"
         f"_del AS (\n"
         f"    SELECT {delta_group_cols}, {del_agg_sql}\n"
         f"    FROM _changes AS _delta\n"
-        f"    WHERE _delta.change_type IN ('delete', 'update_preimage'){where_clause}\n"
+        f"    WHERE _delta.change_type"
+        f" IN ('delete', 'update_preimage'){where_clause}\n"
         f"    GROUP BY {delta_group_cols}\n"
         f")\n"
         f"SELECT {coalesce_group}, {net_sql}\n"
@@ -444,7 +518,6 @@ def _gen_aggregate_maintenance(
         elif agg_type == "AVG":
             sum_col = naming.aux_column(f"sum_{alias}")
             update_sets.append(f"{sum_col} = mv.{sum_col} + d._net_{sum_col}")
-            # Recompute AVG from updated sum/count
             update_sets.append(
                 f"{alias} = CAST(mv.{sum_col} + d._net_{sum_col} AS DOUBLE) "
                 f"/ (mv.{ivm_count_col} + d._net_count)"
@@ -505,6 +578,245 @@ def _gen_aggregate_maintenance(
 
 
 # ---------------------------------------------------------------------------
+# Stage 4: Two-table inner JOIN maintenance
+# ---------------------------------------------------------------------------
+
+
+def _compile_join(
+    ast: exp.Select,
+    tables: list[exp.Table],
+    joins: list,
+    dialect: str,
+    naming: Naming,
+    sources: dict[str, dict] | None,
+    mv_catalog: str,
+    mv_schema: str,
+    mv_table: str,
+    mv_fqn: str,
+    cursors_fqn: str,
+    create_cursors: str,
+) -> IVMPlan:
+    """Compile a two-table inner join view."""
+    if len(joins) != 1:
+        raise UnsupportedSQLError("multi_join", "Only two-table joins supported")
+
+    join_node = joins[0]
+    # Left table is in FROM, right table is in JOIN
+    left_table_node = ast.args["from_"].this
+    right_table_node = join_node.this
+    left_name = left_table_node.name
+    right_name = right_table_node.name
+
+    left_src = _resolve_source(left_name, sources, mv_catalog, mv_schema)
+    right_src = _resolve_source(right_name, sources, mv_catalog, mv_schema)
+
+    table_sources = {left_name: left_src, right_name: right_src}
+    left_fqn = f"{left_src['catalog']}.{left_src['schema']}.{left_name}"
+    right_fqn = f"{right_src['catalog']}.{right_src['schema']}.{right_name}"
+
+    # Extract the ON condition
+    on_condition = join_node.args.get("on")
+
+    # Get output col names
+    out_col_names = _extract_output_col_names(ast)
+
+    create_mv = _gen_create_mv_join(ast, mv_fqn, table_sources, dialect)
+    init_cursors = [
+        _gen_init_cursor(cursors_fqn, mv_table, left_src),
+    ]
+    # Only add second cursor if catalogs differ
+    if left_src["catalog"] != right_src["catalog"]:
+        init_cursors.append(_gen_init_cursor(cursors_fqn, mv_table, right_src))
+
+    # --- Maintenance SQL ---
+    # Always generate the full three-way decomposition since at runtime
+    # we don't know which tables changed. The cross-delta subtraction
+    # handles the case where both changed simultaneously, and is a no-op
+    # (empty result) when only one table changed.
+
+    set_vars_left = _gen_set_snapshot_vars_named(left_src, cursors_fqn, mv_table, "l")
+    set_vars_right = _gen_set_snapshot_vars_named(right_src, cursors_fqn, mv_table, "r")
+
+    changes_l = _gen_changes_cte_named(left_src, "_changes_l", "l")
+    changes_r = _gen_changes_cte_named(right_src, "_changes_r", "r")
+
+    # Rewrite ON condition for delta aliases
+    def _rewrite_on_for_delta(on_node: exp.Expression, delta_alias: str, table_name: str):
+        """Replace references to table_name with delta_alias in the ON condition."""
+
+        def _replace(node: exp.Expression) -> exp.Expression:
+            if isinstance(node, exp.Column) and node.table == table_name:
+                return exp.column(node.name, table=delta_alias)
+            return node
+
+        return on_node.copy().transform(_replace)
+
+    # Rewrite projection for delta queries
+    def _rewrite_proj(sel_list: list, delta_alias: str, table_name: str, dialect: str) -> str:
+        """Replace references to table_name with delta_alias in projections."""
+        parts = []
+        for sel in sel_list:
+            rewritten = sel.copy().transform(
+                lambda node: (
+                    exp.column(node.name, table=delta_alias)
+                    if isinstance(node, exp.Column) and node.table == table_name
+                    else node
+                )
+            )
+            parts.append(rewritten.sql(dialect=dialect))
+        return ", ".join(parts)
+
+    # The ON condition rewritten for each delta scenario
+    on_delta_l = _rewrite_on_for_delta(on_condition, "_dl", left_name)
+    on_delta_r = _rewrite_on_for_delta(on_condition, "_dr", right_name)
+    on_delta_both_l = on_delta_l.copy().transform(
+        lambda node: (
+            exp.column(node.name, table="_dr")
+            if isinstance(node, exp.Column) and node.table == right_name
+            else node
+        )
+    )
+
+    on_dl_sql = on_delta_l.sql(dialect=dialect)
+    on_dr_sql = on_delta_r.sql(dialect=dialect)
+    on_cross_sql = on_delta_both_l.sql(dialect=dialect)
+
+    # Projection rewritten for each term
+    proj_dl_s = _rewrite_proj(list(ast.selects), "_dl", left_name, dialect)
+    proj_r_dr = _rewrite_proj(list(ast.selects), "_dr", right_name, dialect)
+    proj_cross = _rewrite_proj(list(ast.selects), "_dl", left_name, dialect)
+    proj_cross = _rewrite_proj(
+        [sqlglot.parse_one(p.strip(), dialect=dialect) for p in proj_cross.split(",")],
+        "_dr",
+        right_name,
+        dialect,
+    )
+
+    # For DELETE we use pre-update (old) table state via DuckLake time travel.
+    # The old snapshot = snap_start - 1 (the last snapshot the cursor saw).
+    # AT VERSION can't be aliased directly, so we wrap in a subquery.
+    right_old = f"(SELECT * FROM {right_fqn} AT (VERSION => getvariable('_ivm_snap_start_r') - 1))"
+    left_old = f"(SELECT * FROM {left_fqn} AT (VERSION => getvariable('_ivm_snap_start_l') - 1))"
+
+    # --- DELETE: (∇R ⋈ S_old) ∪ (R_old ⋈ ∇S) - (∇R ⋈ ∇S) ---
+    all_proj_cols = ", ".join(out_col_names)
+    join_on_parts = [f"m.{c} IS NOT DISTINCT FROM d.{c}" for c in out_col_names]
+    join_on = " AND ".join(join_on_parts)
+
+    delete_sql = (
+        f"WITH {changes_l},\n"
+        f"{changes_r},\n"
+        f"_del_from_l AS (\n"
+        f"    SELECT {proj_dl_s}\n"
+        f"    FROM _changes_l AS _dl\n"
+        f"    JOIN {right_old} AS {right_name} ON {on_dl_sql}\n"
+        f"    WHERE _dl.change_type IN ('delete', 'update_preimage')\n"
+        f"),\n"
+        f"_del_from_r AS (\n"
+        f"    SELECT {proj_r_dr}\n"
+        f"    FROM {left_old} AS {left_name}\n"
+        f"    JOIN _changes_r AS _dr ON {on_dr_sql}\n"
+        f"    WHERE _dr.change_type IN ('delete', 'update_preimage')\n"
+        f"),\n"
+        f"_del_cross AS (\n"
+        f"    SELECT {proj_cross}\n"
+        f"    FROM _changes_l AS _dl\n"
+        f"    JOIN _changes_r AS _dr ON {on_cross_sql}\n"
+        f"    WHERE _dl.change_type IN ('delete', 'update_preimage')\n"
+        f"    AND _dr.change_type IN ('delete', 'update_preimage')\n"
+        f"),\n"
+        f"_all_deletes AS (\n"
+        f"    SELECT * FROM _del_from_l\n"
+        f"    UNION ALL\n"
+        f"    SELECT * FROM _del_from_r\n"
+        f"    EXCEPT ALL\n"
+        f"    SELECT * FROM _del_cross\n"
+        f"),\n"
+        f"_deletes_numbered AS (\n"
+        f"    SELECT *, ROW_NUMBER() OVER (\n"
+        f"        PARTITION BY {all_proj_cols}"
+        f" ORDER BY (SELECT NULL)) AS _dn\n"
+        f"    FROM _all_deletes\n"
+        f"),\n"
+        f"_mv_numbered AS (\n"
+        f"    SELECT rowid AS _rid, {all_proj_cols},\n"
+        f"        ROW_NUMBER() OVER ("
+        f"PARTITION BY {all_proj_cols} ORDER BY rowid) AS _mn\n"
+        f"    FROM {mv_fqn}\n"
+        f")\n"
+        f"DELETE FROM {mv_fqn}\n"
+        f"WHERE rowid IN (\n"
+        f"    SELECT _rid FROM _mv_numbered m\n"
+        f"    JOIN _deletes_numbered d"
+        f" ON {join_on} AND m._mn = d._dn\n"
+        f")"
+    )
+
+    # --- INSERT: (ΔR ⋈ S) ∪ (R ⋈ ΔS) - (ΔR ⋈ ΔS) ---
+    col_list = ", ".join(out_col_names)
+    insert_sql = (
+        f"WITH {changes_l},\n"
+        f"{changes_r},\n"
+        f"_ins_from_l AS (\n"
+        f"    SELECT {proj_dl_s}\n"
+        f"    FROM _changes_l AS _dl\n"
+        f"    JOIN {right_fqn} AS {right_name} ON {on_dl_sql}\n"
+        f"    WHERE _dl.change_type IN ('insert', 'update_postimage')\n"
+        f"),\n"
+        f"_ins_from_r AS (\n"
+        f"    SELECT {proj_r_dr}\n"
+        f"    FROM {left_fqn} AS {left_name}\n"
+        f"    JOIN _changes_r AS _dr ON {on_dr_sql}\n"
+        f"    WHERE _dr.change_type IN ('insert', 'update_postimage')\n"
+        f"),\n"
+        f"_ins_cross AS (\n"
+        f"    SELECT {proj_cross}\n"
+        f"    FROM _changes_l AS _dl\n"
+        f"    JOIN _changes_r AS _dr ON {on_cross_sql}\n"
+        f"    WHERE _dl.change_type IN ('insert', 'update_postimage')\n"
+        f"    AND _dr.change_type IN ('insert', 'update_postimage')\n"
+        f"),\n"
+        f"_all_inserts AS (\n"
+        f"    SELECT * FROM _ins_from_l\n"
+        f"    UNION ALL\n"
+        f"    SELECT * FROM _ins_from_r\n"
+        f"    EXCEPT ALL\n"
+        f"    SELECT * FROM _ins_cross\n"
+        f")\n"
+        f"INSERT INTO {mv_fqn} ({col_list})\n"
+        f"SELECT * FROM _all_inserts"
+    )
+
+    # --- Update cursors ---
+    update_cursor_l = _gen_update_cursor(cursors_fqn, mv_table, left_src)
+    update_cursor_r = _gen_update_cursor(cursors_fqn, mv_table, right_src)
+
+    maintain = [
+        *set_vars_left,
+        *set_vars_right,
+        delete_sql,
+        insert_sql,
+        update_cursor_l,
+        update_cursor_r,
+    ]
+
+    features = _detect_features(ast)
+    features.add("join")
+
+    base_tables = {left_name: left_src["catalog"], right_name: right_src["catalog"]}
+
+    return IVMPlan(
+        view_sql=ast.sql(dialect=dialect),
+        create_cursors_table=create_cursors,
+        create_mv=create_mv,
+        initialize_cursors=init_cursors,
+        maintain=maintain,
+        base_tables=base_tables,
+        features=features,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
@@ -513,8 +825,10 @@ def _gen_update_cursor(cursors_fqn: str, mv_table: str, src: dict[str, str]) -> 
     return (
         f"UPDATE {cursors_fqn}\n"
         f"SET last_snapshot = (\n"
-        f"    SELECT MAX(snapshot_id) FROM ducklake_snapshots('{src['catalog']}'))\n"
-        f"WHERE mv_name = '{mv_table}' AND source_catalog = '{src['catalog']}'"
+        f"    SELECT MAX(snapshot_id)"
+        f" FROM ducklake_snapshots('{src['catalog']}'))\n"
+        f"WHERE mv_name = '{mv_table}'"
+        f" AND source_catalog = '{src['catalog']}'"
     )
 
 
@@ -524,6 +838,8 @@ def _detect_features(ast: exp.Select) -> set[str]:
         features.add("where")
     if ast.args.get("group"):
         features.add("group_by")
+    if ast.args.get("joins"):
+        features.add("join")
     for agg in ast.find_all(exp.AggFunc):
         if isinstance(agg, exp.Sum):
             features.add("sum")
