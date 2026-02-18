@@ -11,6 +11,7 @@ from duckstream.compiler.infrastructure import (
     _gen_changes_cte_named,
     _gen_create_mv_join,
     _gen_init_cursor,
+    _gen_query_mv,
     _gen_set_snapshot_vars_named,
     _gen_update_cursor,
     _resolve_source,
@@ -204,6 +205,8 @@ def _compile_outer_join(
     features.add(f"{join_side.lower()}_join")
     base_tables = {left_name: left_src["catalog"], right_name: right_src["catalog"]}
 
+    query_mv = _gen_query_mv(ast, mv_fqn, naming, dialect)
+
     return IVMPlan(
         view_sql=ast.sql(dialect=dialect),
         create_cursors_table=create_cursors,
@@ -212,6 +215,7 @@ def _compile_outer_join(
         maintain=maintain,
         base_tables=base_tables,
         features=features,
+        query_mv=query_mv,
     )
 
 

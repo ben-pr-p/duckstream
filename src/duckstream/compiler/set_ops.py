@@ -298,6 +298,10 @@ def _compile_union_all(
         tbl = list(b.find_all(exp.Table))[0].name
         base_tables[tbl] = s["catalog"]
 
+    visible_cols = [c for c in out_col_names if not c.startswith("_ivm_")]
+    cols_sql = ", ".join(visible_cols) if visible_cols else "*"
+    query_mv = f"SELECT {cols_sql} FROM {mv_fqn}"
+
     return IVMPlan(
         view_sql=ast.sql(dialect=dialect),
         create_cursors_table=create_cursors,
@@ -306,6 +310,7 @@ def _compile_union_all(
         maintain=maintain,
         base_tables=base_tables,
         features=features,
+        query_mv=query_mv,
     )
 
 
@@ -423,6 +428,10 @@ def _compile_union_distinct(
         tbl = list(b.find_all(exp.Table))[0].name
         base_tables[tbl] = s["catalog"]
 
+    visible_cols = [c for c in out_col_names if not c.startswith("_ivm_")]
+    cols_sql = ", ".join(visible_cols) if visible_cols else "*"
+    query_mv = f"SELECT {cols_sql} FROM {mv_fqn}"
+
     return IVMPlan(
         view_sql=ast.sql(dialect=dialect),
         create_cursors_table=create_cursors,
@@ -431,6 +440,7 @@ def _compile_union_distinct(
         maintain=maintain,
         base_tables=base_tables,
         features=features,
+        query_mv=query_mv,
     )
 
 
@@ -543,6 +553,10 @@ def _compile_bag_set_op(
         tbl = list(b.find_all(exp.Table))[0].name
         base_tables[tbl] = s["catalog"]
 
+    visible_cols = [c for c in out_col_names if not c.startswith("_ivm_")]
+    cols_sql = ", ".join(visible_cols) if visible_cols else "*"
+    query_mv = f"SELECT {cols_sql} FROM {mv_fqn}"
+
     return IVMPlan(
         view_sql=ast.sql(dialect=dialect),
         create_cursors_table=create_cursors,
@@ -551,6 +565,7 @@ def _compile_bag_set_op(
         maintain=maintain,
         base_tables=base_tables,
         features=features,
+        query_mv=query_mv,
     )
 
 

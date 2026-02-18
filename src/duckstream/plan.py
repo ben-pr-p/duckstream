@@ -25,6 +25,7 @@ class IVMPlan:
     maintain: list[str]
     base_tables: dict[str, str]  # table_name -> catalog
     features: set[str] = field(default_factory=set)
+    query_mv: str = ""
 
 
 class UnsupportedSQLError(Exception):
