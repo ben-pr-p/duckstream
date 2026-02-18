@@ -22,6 +22,10 @@ _RESERVED = {
     "count", "sum", "avg", "min", "max", "all", "distinct", "between", "like",
     "exists", "case", "when", "then", "else", "end", "union", "except", "left",
     "right", "inner", "outer", "full", "cross", "with", "key", "rowid",
+    "do", "if", "at", "to", "go", "no", "of", "for", "int", "add", "drop",
+    "alter", "index", "check", "primary", "foreign", "references", "column",
+    "version", "type", "row", "asc", "desc", "over", "partition",
+    "mv", "_ivm_cursors",  # IVM internal names
 }  # fmt: skip
 
 safe_col_names = col_names.filter(lambda n: n not in _RESERVED)
@@ -132,12 +136,12 @@ def single_table_select(draw):
     columns = []
     used_names = set()
     for i in range(n_cols):
-        name = draw(col_names.filter(lambda n: n not in used_names))
+        name = draw(safe_col_names.filter(lambda n: n not in used_names))
         used_names.add(name)
         dtype = draw(col_type()) if i > 0 else "INTEGER"  # first col always INT
         columns.append(Column(name=name, dtype=dtype))
 
-    tname = draw(table_names.filter(lambda n: n not in used_names))
+    tname = draw(safe_table_names.filter(lambda n: n not in used_names))
     table = Table(name=tname, columns=columns)
 
     initial_rows = draw(rows_for_table(table, min_size=1, max_size=15))
@@ -188,14 +192,14 @@ def single_table_select(draw):
 @st.composite
 def single_table_aggregate(draw):
     """Scenario: SELECT <group_cols>, <agg>(<col>) FROM <table> GROUP BY <group_cols>."""
-    group_name = draw(col_names)
+    group_name = draw(safe_col_names)
     used = {group_name}
-    agg_name = draw(col_names.filter(lambda n: n not in used))
+    agg_name = draw(safe_col_names.filter(lambda n: n not in used))
     used.add(agg_name)
 
     extra_cols = []
     for _ in range(draw(st.integers(min_value=0, max_value=2))):
-        name = draw(col_names.filter(lambda n: n not in used))
+        name = draw(safe_col_names.filter(lambda n: n not in used))
         used.add(name)
         extra_cols.append(Column(name=name, dtype=draw(col_type())))
 
@@ -205,7 +209,7 @@ def single_table_aggregate(draw):
         *extra_cols,
     ]
 
-    tname = draw(table_names.filter(lambda n: n not in used))
+    tname = draw(safe_table_names.filter(lambda n: n not in used))
     table = Table(name=tname, columns=columns)
 
     initial_rows = draw(rows_for_table(table, min_size=2, max_size=15))
@@ -252,13 +256,13 @@ def single_table_distinct(draw):
     columns = []
     used_names: set[str] = set()
     for i in range(n_cols):
-        name = draw(col_names.filter(lambda n: n not in used_names))
+        name = draw(safe_col_names.filter(lambda n: n not in used_names))
         used_names.add(name)
         # Use small-range types to produce duplicates
         dtype = draw(st.sampled_from(["INTEGER", "VARCHAR"])) if i > 0 else "INTEGER"
         columns.append(Column(name=name, dtype=dtype))
 
-    tname = draw(table_names.filter(lambda n: n not in used_names))
+    tname = draw(safe_table_names.filter(lambda n: n not in used_names))
     table = Table(name=tname, columns=columns)
 
     # Generate initial data with small value ranges to produce duplicates
@@ -446,6 +450,123 @@ def two_table_join(draw):
     return Scenario(
         tables=[left_table, right_table],
         initial_data={left_name: left_rows, right_name: right_rows},
+        view_sql=view_sql,
+        deltas=deltas,
+    )
+
+
+@st.composite
+def three_table_join(draw):
+    """Scenario: SELECT ... FROM R JOIN S ON ... JOIN T ON ... (chain join)."""
+    used: set[str] = set()
+
+    # Two join keys: R-S share key1, S-T share key2
+    key1 = draw(safe_col_names.filter(lambda n: n not in used))
+    used.add(key1)
+    key2 = draw(safe_col_names.filter(lambda n: n not in used))
+    used.add(key2)
+
+    # Extra column per table
+    col_r = draw(safe_col_names.filter(lambda n: n not in used))
+    used.add(col_r)
+    col_s = draw(safe_col_names.filter(lambda n: n not in used))
+    used.add(col_s)
+    col_t = draw(safe_col_names.filter(lambda n: n not in used))
+    used.add(col_t)
+
+    r_name = draw(safe_table_names.filter(lambda n: n not in used))
+    used.add(r_name)
+    s_name = draw(safe_table_names.filter(lambda n: n not in used))
+    used.add(s_name)
+    t_name = draw(safe_table_names.filter(lambda n: n not in used))
+    used.add(t_name)
+
+    r_table = Table(r_name, [Column(key1, "INTEGER"), Column(col_r, "INTEGER")])
+    s_table = Table(
+        s_name, [Column(key1, "INTEGER"), Column(key2, "INTEGER"), Column(col_s, "VARCHAR")]
+    )
+    t_table = Table(t_name, [Column(key2, "INTEGER"), Column(col_t, "VARCHAR")])
+
+    # Overlapping key pools
+    key1_pool = draw(st.lists(st.integers(1, 10), min_size=3, max_size=6, unique=True))
+    key2_pool = draw(st.lists(st.integers(1, 10), min_size=3, max_size=6, unique=True))
+
+    r_rows = []
+    for _ in range(draw(st.integers(2, 6))):
+        r_rows.append(
+            Row({key1: draw(st.sampled_from(key1_pool)), col_r: draw(st.integers(-50, 50))})
+        )
+
+    s_rows = []
+    for _ in range(draw(st.integers(2, 6))):
+        s_rows.append(
+            Row(
+                {
+                    key1: draw(st.sampled_from(key1_pool)),
+                    key2: draw(st.sampled_from(key2_pool)),
+                    col_s: draw(st.sampled_from(["x", "y", "z"])),
+                }
+            )
+        )
+
+    t_rows = []
+    for _ in range(draw(st.integers(2, 6))):
+        t_rows.append(
+            Row({key2: draw(st.sampled_from(key2_pool)), col_t: draw(st.sampled_from(["p", "q"]))})
+        )
+
+    # Projection: pick from all three tables
+    all_proj = [
+        f"{r_name}.{key1}",
+        f"{r_name}.{col_r}",
+        f"{s_name}.{col_s}",
+        f"{t_name}.{col_t}",
+    ]
+    proj_cols = draw(
+        st.lists(st.sampled_from(all_proj), min_size=2, max_size=len(all_proj), unique=True)
+    )
+    select_clause = ", ".join(proj_cols)
+
+    view_sql = (
+        f"SELECT {select_clause} FROM {r_name}"
+        f" JOIN {s_name} ON {r_name}.{key1} = {s_name}.{key1}"
+        f" JOIN {t_name} ON {s_name}.{key2} = {t_name}.{key2}"
+    )
+
+    # Deltas: choose 1, 2, or all 3 tables
+    delta_targets = draw(
+        st.lists(st.sampled_from([r_name, s_name, t_name]), min_size=1, max_size=3, unique=True)
+    )
+    deltas = []
+
+    table_map = {r_name: (r_table, r_rows), s_name: (s_table, s_rows), t_name: (t_table, t_rows)}
+    for tname in delta_targets:
+        table, rows = table_map[tname]
+        inserts = []
+        for _ in range(draw(st.integers(0, 2))):
+            vals: dict[str, object] = {}
+            for col in table.columns:
+                if col.name == key1:
+                    vals[col.name] = draw(st.sampled_from(key1_pool))
+                elif col.name == key2:
+                    vals[col.name] = draw(st.sampled_from(key2_pool))
+                else:
+                    vals[col.name] = draw(value_for_type(col.dtype))
+            inserts.append(Row(vals))
+        n_del = draw(st.integers(0, min(2, len(rows))))
+        del_idx = (
+            draw(
+                st.lists(st.integers(0, len(rows) - 1), min_size=n_del, max_size=n_del, unique=True)
+            )
+            if n_del > 0
+            else []
+        )
+        deletes = [rows[i] for i in del_idx]
+        deltas.append(Delta(tname, inserts=inserts, deletes=deletes))
+
+    return Scenario(
+        tables=[r_table, s_table, t_table],
+        initial_data={r_name: r_rows, s_name: s_rows, t_name: t_rows},
         view_sql=view_sql,
         deltas=deltas,
     )

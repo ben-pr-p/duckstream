@@ -28,6 +28,7 @@ from tests.strategies import (
     single_table_aggregate,
     single_table_distinct,
     single_table_select,
+    three_table_join,
     two_table_join,
 )
 
@@ -281,6 +282,21 @@ def test_join_then_aggregate(scenario):
 )
 def test_single_table_distinct(scenario):
     """SELECT DISTINCT on a single table maintains correctly."""
+    con, catalog, cleanup = make_ducklake()
+    try:
+        assert_ivm_correct(scenario, (con, catalog))
+    finally:
+        cleanup()
+
+
+@given(scenario=three_table_join())
+@settings(
+    max_examples=50,
+    suppress_health_check=[HealthCheck.too_slow],
+    deadline=None,
+)
+def test_three_table_join(scenario):
+    """Three-table inner JOIN chain maintains correctly."""
     con, catalog, cleanup = make_ducklake()
     try:
         assert_ivm_correct(scenario, (con, catalog))
@@ -782,6 +798,78 @@ class TestSmoke:
                     inserts=[],
                     deletes=[Row({"grp": "b", "val": 10})],
                 )
+            ],
+        )
+        assert_ivm_correct(scenario, ducklake)
+
+    def test_three_table_join_insert_first(self, ducklake):
+        """3-table join: insert into first table."""
+        r = Table("r", [Column("k1", "INTEGER"), Column("rv", "INTEGER")])
+        s = Table("s", [Column("k1", "INTEGER"), Column("k2", "INTEGER")])
+        t = Table("t", [Column("k2", "INTEGER"), Column("tv", "VARCHAR")])
+        scenario = Scenario(
+            tables=[r, s, t],
+            initial_data={
+                "r": [Row({"k1": 1, "rv": 10}), Row({"k1": 2, "rv": 20})],
+                "s": [Row({"k1": 1, "k2": 100}), Row({"k1": 2, "k2": 200})],
+                "t": [Row({"k2": 100, "tv": "a"}), Row({"k2": 200, "tv": "b"})],
+            },
+            view_sql=("SELECT r.k1, r.rv, t.tv FROM r JOIN s ON r.k1 = s.k1 JOIN t ON s.k2 = t.k2"),
+            deltas=[Delta("r", inserts=[Row({"k1": 1, "rv": 30})], deletes=[])],
+        )
+        assert_ivm_correct(scenario, ducklake)
+
+    def test_three_table_join_insert_middle(self, ducklake):
+        """3-table join: insert into middle table creates new join paths."""
+        r = Table("r", [Column("k1", "INTEGER"), Column("rv", "INTEGER")])
+        s = Table("s", [Column("k1", "INTEGER"), Column("k2", "INTEGER")])
+        t = Table("t", [Column("k2", "INTEGER"), Column("tv", "VARCHAR")])
+        scenario = Scenario(
+            tables=[r, s, t],
+            initial_data={
+                "r": [Row({"k1": 1, "rv": 10})],
+                "s": [Row({"k1": 1, "k2": 100})],
+                "t": [Row({"k2": 100, "tv": "a"}), Row({"k2": 200, "tv": "b"})],
+            },
+            view_sql=("SELECT r.k1, r.rv, t.tv FROM r JOIN s ON r.k1 = s.k1 JOIN t ON s.k2 = t.k2"),
+            deltas=[Delta("s", inserts=[Row({"k1": 1, "k2": 200})], deletes=[])],
+        )
+        assert_ivm_correct(scenario, ducklake)
+
+    def test_three_table_join_delete_middle(self, ducklake):
+        """3-table join: delete from middle table breaks join paths."""
+        r = Table("r", [Column("k1", "INTEGER"), Column("rv", "INTEGER")])
+        s = Table("s", [Column("k1", "INTEGER"), Column("k2", "INTEGER")])
+        t = Table("t", [Column("k2", "INTEGER"), Column("tv", "VARCHAR")])
+        scenario = Scenario(
+            tables=[r, s, t],
+            initial_data={
+                "r": [Row({"k1": 1, "rv": 10})],
+                "s": [Row({"k1": 1, "k2": 100}), Row({"k1": 1, "k2": 200})],
+                "t": [Row({"k2": 100, "tv": "a"}), Row({"k2": 200, "tv": "b"})],
+            },
+            view_sql=("SELECT r.k1, r.rv, t.tv FROM r JOIN s ON r.k1 = s.k1 JOIN t ON s.k2 = t.k2"),
+            deltas=[Delta("s", inserts=[], deletes=[Row({"k1": 1, "k2": 100})])],
+        )
+        assert_ivm_correct(scenario, ducklake)
+
+    def test_three_table_join_insert_all(self, ducklake):
+        """3-table join: insert into all three tables simultaneously."""
+        r = Table("r", [Column("k1", "INTEGER"), Column("rv", "INTEGER")])
+        s = Table("s", [Column("k1", "INTEGER"), Column("k2", "INTEGER")])
+        t = Table("t", [Column("k2", "INTEGER"), Column("tv", "VARCHAR")])
+        scenario = Scenario(
+            tables=[r, s, t],
+            initial_data={
+                "r": [Row({"k1": 1, "rv": 10})],
+                "s": [Row({"k1": 1, "k2": 100})],
+                "t": [Row({"k2": 100, "tv": "a"})],
+            },
+            view_sql=("SELECT r.k1, r.rv, t.tv FROM r JOIN s ON r.k1 = s.k1 JOIN t ON s.k2 = t.k2"),
+            deltas=[
+                Delta("r", inserts=[Row({"k1": 2, "rv": 20})], deletes=[]),
+                Delta("s", inserts=[Row({"k1": 2, "k2": 200})], deletes=[]),
+                Delta("t", inserts=[Row({"k2": 200, "tv": "b"})], deletes=[]),
             ],
         )
         assert_ivm_correct(scenario, ducklake)

@@ -821,142 +821,230 @@ def _compile_join(
     cursors_fqn: str,
     create_cursors: str,
 ) -> IVMPlan:
-    """Compile a two-table inner join view."""
-    if len(joins) != 1:
-        raise UnsupportedSQLError("multi_join", "Only two-table joins supported")
+    """Compile an N-table inner join view (2+ tables).
 
-    join_node = joins[0]
-    # Left table is in FROM, right table is in JOIN
-    left_table_node = ast.args["from_"].this
-    right_table_node = join_node.this
-    left_name = left_table_node.name
-    right_name = right_table_node.name
+    Uses inclusion-exclusion to compute the join delta:
+    For each non-empty subset S of tables, generate a term where the tables
+    in S use their delta changes and the rest use current/old state.
+    Sign is (-1)^(|S|-1): positive for odd-size subsets, negative for even.
+    """
+    # Extract ordered table info: FROM table + each JOIN table
+    from_table_node = ast.args["from_"].this
+    table_names_ordered = [from_table_node.name]
+    join_on_conditions = []
+    for join_node in joins:
+        table_names_ordered.append(join_node.this.name)
+        join_on_conditions.append(join_node.args.get("on"))
 
-    left_src = _resolve_source(left_name, sources, mv_catalog, mv_schema)
-    right_src = _resolve_source(right_name, sources, mv_catalog, mv_schema)
+    n_tables = len(table_names_ordered)
 
-    table_sources = {left_name: left_src, right_name: right_src}
-    left_fqn = f"{left_src['catalog']}.{left_src['schema']}.{left_name}"
-    right_fqn = f"{right_src['catalog']}.{right_src['schema']}.{right_name}"
+    # Resolve sources and build FQNs
+    table_sources: dict[str, dict[str, str]] = {}
+    table_fqns: dict[str, str] = {}
+    for tname in table_names_ordered:
+        src = _resolve_source(tname, sources, mv_catalog, mv_schema)
+        table_sources[tname] = src
+        table_fqns[tname] = f"{src['catalog']}.{src['schema']}.{tname}"
 
-    # Extract the ON condition
-    on_condition = join_node.args.get("on")
-
-    # Get output col names
     out_col_names = _extract_output_col_names(ast)
 
     create_mv = _gen_create_mv_join(ast, mv_fqn, table_sources, dialect)
-    init_cursors = [
-        _gen_init_cursor(cursors_fqn, mv_table, left_src),
-    ]
-    # Only add second cursor if catalogs differ
-    if left_src["catalog"] != right_src["catalog"]:
-        init_cursors.append(_gen_init_cursor(cursors_fqn, mv_table, right_src))
 
-    # --- Maintenance SQL ---
-    # Always generate the full three-way decomposition since at runtime
-    # we don't know which tables changed. The cross-delta subtraction
-    # handles the case where both changed simultaneously, and is a no-op
-    # (empty result) when only one table changed.
+    # Initialize cursors — one per unique catalog
+    seen_catalogs: set[str] = set()
+    init_cursors = []
+    for tname in table_names_ordered:
+        src = table_sources[tname]
+        if src["catalog"] not in seen_catalogs:
+            init_cursors.append(_gen_init_cursor(cursors_fqn, mv_table, src))
+            seen_catalogs.add(src["catalog"])
 
-    set_vars_left = _gen_set_snapshot_vars_named(left_src, cursors_fqn, mv_table, "l")
-    set_vars_right = _gen_set_snapshot_vars_named(right_src, cursors_fqn, mv_table, "r")
+    # --- Snapshot variables and changes CTEs ---
+    # Use table index as suffix for variable names
+    all_set_vars: list[str] = []
+    suffixes: dict[str, str] = {}
+    changes_ctes: dict[str, str] = {}
+    for idx, tname in enumerate(table_names_ordered):
+        suffix = str(idx)
+        suffixes[tname] = suffix
+        src = table_sources[tname]
+        all_set_vars.extend(_gen_set_snapshot_vars_named(src, cursors_fqn, mv_table, suffix))
+        cte_name = f"_changes_{idx}"
+        changes_ctes[tname] = _gen_changes_cte_named(src, cte_name, suffix)
 
-    changes_l = _gen_changes_cte_named(left_src, "_changes_l", "l")
-    changes_r = _gen_changes_cte_named(right_src, "_changes_r", "r")
+    # Delta alias for table i when it's in the delta subset
+    def _delta_alias(tname: str) -> str:
+        return f"_d{suffixes[tname]}"
 
-    # Rewrite ON condition for delta aliases
-    def _rewrite_on_for_delta(on_node: exp.Expression, delta_alias: str, table_name: str):
-        """Replace references to table_name with delta_alias in the ON condition."""
+    # Old table reference for deletes (time travel to pre-update state)
+    def _old_ref(tname: str) -> str:
+        suffix = suffixes[tname]
+        fqn = table_fqns[tname]
+        return f"(SELECT * FROM {fqn} AT (VERSION => getvariable('_ivm_snap_start_{suffix}') - 1))"
+
+    # Quote table name for use as alias (handles reserved keywords)
+    def _quote_alias(tname: str) -> str:
+        return f'"{tname}"'
+
+    # --- Rewrite helpers ---
+    def _rewrite_expr(
+        expr: exp.Expression, alias_map: dict[str, str], dialect: str
+    ) -> exp.Expression:
+        """Replace table references according to alias_map."""
 
         def _replace(node: exp.Expression) -> exp.Expression:
-            if isinstance(node, exp.Column) and node.table == table_name:
-                return exp.column(node.name, table=delta_alias)
+            if isinstance(node, exp.Column) and node.table in alias_map:
+                return exp.column(node.name, table=alias_map[node.table])
             return node
 
-        return on_node.copy().transform(_replace)
+        return expr.copy().transform(_replace)
 
-    # Rewrite projection for delta queries
-    def _rewrite_proj(sel_list: list, delta_alias: str, table_name: str, dialect: str) -> str:
-        """Replace references to table_name with delta_alias in projections."""
+    def _rewrite_proj_sql(alias_map: dict[str, str]) -> str:
+        """Rewrite projection with alias_map and return SQL string."""
         parts = []
-        for sel in sel_list:
-            rewritten = sel.copy().transform(
-                lambda node: (
-                    exp.column(node.name, table=delta_alias)
-                    if isinstance(node, exp.Column) and node.table == table_name
-                    else node
-                )
-            )
+        for sel in ast.selects:
+            rewritten = _rewrite_expr(sel, alias_map, dialect)
             parts.append(rewritten.sql(dialect=dialect))
         return ", ".join(parts)
 
-    # The ON condition rewritten for each delta scenario
-    on_delta_l = _rewrite_on_for_delta(on_condition, "_dl", left_name)
-    on_delta_r = _rewrite_on_for_delta(on_condition, "_dr", right_name)
-    on_delta_both_l = on_delta_l.copy().transform(
-        lambda node: (
-            exp.column(node.name, table="_dr")
-            if isinstance(node, exp.Column) and node.table == right_name
-            else node
-        )
-    )
+    # --- Generate inclusion-exclusion terms ---
+    # For each non-empty subset of tables, generate a CTE.
+    # Sign: positive for odd-size subsets, negative for even-size.
 
-    on_dl_sql = on_delta_l.sql(dialect=dialect)
-    on_dr_sql = on_delta_r.sql(dialect=dialect)
-    on_cross_sql = on_delta_both_l.sql(dialect=dialect)
+    def _gen_term_cte(
+        subset: list[str],
+        change_type_filter: str,
+        use_old_for_non_delta: bool,
+    ) -> str:
+        """Generate a single inclusion-exclusion term.
 
-    # Projection rewritten for each term
-    proj_dl_s = _rewrite_proj(list(ast.selects), "_dl", left_name, dialect)
-    proj_r_dr = _rewrite_proj(list(ast.selects), "_dr", right_name, dialect)
-    proj_cross = _rewrite_proj(list(ast.selects), "_dl", left_name, dialect)
-    proj_cross = _rewrite_proj(
-        [sqlglot.parse_one(p.strip(), dialect=dialect) for p in proj_cross.split(",")],
-        "_dr",
-        right_name,
-        dialect,
-    )
+        subset: table names that use their delta (changes CTE)
+        change_type_filter: 'insert'/'delete' filter string
+        use_old_for_non_delta: if True, non-delta tables use old state (for deletes)
+        """
+        subset_set = set(subset)
 
-    # For DELETE we use pre-update (old) table state via DuckLake time travel.
-    # The old snapshot = snap_start - 1 (the last snapshot the cursor saw).
-    # AT VERSION can't be aliased directly, so we wrap in a subquery.
-    right_old = f"(SELECT * FROM {right_fqn} AT (VERSION => getvariable('_ivm_snap_start_r') - 1))"
-    left_old = f"(SELECT * FROM {left_fqn} AT (VERSION => getvariable('_ivm_snap_start_l') - 1))"
+        # Build alias map: delta tables get delta alias, others keep table name
+        alias_map: dict[str, str] = {}
+        for tname in table_names_ordered:
+            if tname in subset_set:
+                alias_map[tname] = _delta_alias(tname)
 
-    # --- DELETE: (∇R ⋈ S_old) ∪ (R_old ⋈ ∇S) - (∇R ⋈ ∇S) ---
+        proj_sql = _rewrite_proj_sql(alias_map)
+
+        # Build FROM clause: first table
+        first_tname = table_names_ordered[0]
+        if first_tname in subset_set:
+            from_clause = f"_changes_{suffixes[first_tname]} AS {_delta_alias(first_tname)}"
+        elif use_old_for_non_delta:
+            from_clause = f"{_old_ref(first_tname)} AS {_quote_alias(first_tname)}"
+        else:
+            from_clause = f"{table_fqns[first_tname]} AS {_quote_alias(first_tname)}"
+
+        # Build JOIN clauses for remaining tables
+        join_clauses = []
+        for i, tname in enumerate(table_names_ordered[1:]):
+            on_cond = join_on_conditions[i]
+            rewritten_on = _rewrite_expr(on_cond, alias_map, dialect)
+            on_sql = rewritten_on.sql(dialect=dialect)
+
+            if tname in subset_set:
+                join_ref = f"_changes_{suffixes[tname]} AS {_delta_alias(tname)}"
+            elif use_old_for_non_delta:
+                join_ref = f"{_old_ref(tname)} AS {_quote_alias(tname)}"
+            else:
+                join_ref = f"{table_fqns[tname]} AS {_quote_alias(tname)}"
+
+            join_clauses.append(f"    JOIN {join_ref} ON {on_sql}")
+
+        # WHERE clause: filter delta tables by change_type
+        where_parts = []
+        for tname in subset:
+            da = _delta_alias(tname)
+            where_parts.append(f"{da}.change_type IN {change_type_filter}")
+        where_sql = " AND ".join(where_parts)
+
+        joins_sql = "\n".join(join_clauses)
+        return f"    SELECT {proj_sql}\n    FROM {from_clause}\n{joins_sql}\n    WHERE {where_sql}"
+
+    def _gen_all_terms(
+        change_type_filter: str, use_old: bool
+    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        """Generate all inclusion-exclusion terms, separated by sign.
+
+        Returns (positive_term_cte_names, negative_term_cte_names).
+        """
+        positive_ctes: list[tuple[str, str]] = []
+        negative_ctes: list[tuple[str, str]] = []
+
+        term_idx = 0
+        # Iterate over all non-empty subsets (by size for clarity)
+        for size in range(1, n_tables + 1):
+            sign_positive = size % 2 == 1  # odd size = positive
+            for subset in _subsets_of_size(table_names_ordered, size):
+                cte_body = _gen_term_cte(subset, change_type_filter, use_old)
+                prefix = "del" if use_old else "ins"
+                cte_name = f"_{prefix}_term_{term_idx}"
+                term_idx += 1
+                cte_def = f"{cte_name} AS (\n{cte_body}\n)"
+                if sign_positive:
+                    positive_ctes.append((cte_name, cte_def))
+                else:
+                    negative_ctes.append((cte_name, cte_def))
+
+        return positive_ctes, negative_ctes
+
+    # Changes CTEs (shared across all terms)
+    changes_cte_list = [changes_ctes[tname] for tname in table_names_ordered]
+    changes_cte_sql = ",\n".join(changes_cte_list)
+
+    # --- DELETE: inclusion-exclusion with old state ---
+    del_positive, del_negative = _gen_all_terms("('delete', 'update_preimage')", use_old=True)
+    # --- INSERT: inclusion-exclusion with current state ---
+    ins_positive, ins_negative = _gen_all_terms("('insert', 'update_postimage')", use_old=False)
+
     all_proj_cols = ", ".join(out_col_names)
     join_on_parts = [f"m.{c} IS NOT DISTINCT FROM d.{c}" for c in out_col_names]
     join_on = " AND ".join(join_on_parts)
+    col_list = ", ".join(out_col_names)
 
+    def _build_delta_sql(
+        positive: list[tuple[str, str]],
+        negative: list[tuple[str, str]],
+        all_name: str,
+    ) -> list[str]:
+        """Build CTE definitions and the combined _all_X CTE.
+
+        Uses subqueries to ensure correct precedence:
+        (positive UNION ALL) EXCEPT ALL (negative UNION ALL).
+        """
+        cte_defs = [cte_def for _, cte_def in positive] + [cte_def for _, cte_def in negative]
+
+        pos_union = "\n        UNION ALL\n        ".join(
+            f"SELECT * FROM {name}" for name, _ in positive
+        )
+        if negative:
+            neg_union = "\n        UNION ALL\n        ".join(
+                f"SELECT * FROM {name}" for name, _ in negative
+            )
+            all_cte = (
+                f"{all_name} AS (\n"
+                f"    SELECT * FROM (\n        {pos_union}\n    )\n"
+                f"    EXCEPT ALL\n"
+                f"    SELECT * FROM (\n        {neg_union}\n    )\n"
+                f")"
+            )
+        else:
+            all_cte = f"{all_name} AS (\n    {pos_union}\n)"
+        cte_defs.append(all_cte)
+        return cte_defs
+
+    # DELETE SQL
+    del_cte_defs = _build_delta_sql(del_positive, del_negative, "_all_deletes")
+    del_ctes_sql = ",\n".join(del_cte_defs)
     delete_sql = (
-        f"WITH {changes_l},\n"
-        f"{changes_r},\n"
-        f"_del_from_l AS (\n"
-        f"    SELECT {proj_dl_s}\n"
-        f"    FROM _changes_l AS _dl\n"
-        f"    JOIN {right_old} AS {right_name} ON {on_dl_sql}\n"
-        f"    WHERE _dl.change_type IN ('delete', 'update_preimage')\n"
-        f"),\n"
-        f"_del_from_r AS (\n"
-        f"    SELECT {proj_r_dr}\n"
-        f"    FROM {left_old} AS {left_name}\n"
-        f"    JOIN _changes_r AS _dr ON {on_dr_sql}\n"
-        f"    WHERE _dr.change_type IN ('delete', 'update_preimage')\n"
-        f"),\n"
-        f"_del_cross AS (\n"
-        f"    SELECT {proj_cross}\n"
-        f"    FROM _changes_l AS _dl\n"
-        f"    JOIN _changes_r AS _dr ON {on_cross_sql}\n"
-        f"    WHERE _dl.change_type IN ('delete', 'update_preimage')\n"
-        f"    AND _dr.change_type IN ('delete', 'update_preimage')\n"
-        f"),\n"
-        f"_all_deletes AS (\n"
-        f"    SELECT * FROM _del_from_l\n"
-        f"    UNION ALL\n"
-        f"    SELECT * FROM _del_from_r\n"
-        f"    EXCEPT ALL\n"
-        f"    SELECT * FROM _del_cross\n"
-        f"),\n"
+        f"WITH {changes_cte_sql},\n"
+        f"{del_ctes_sql},\n"
         f"_deletes_numbered AS (\n"
         f"    SELECT *, ROW_NUMBER() OVER (\n"
         f"        PARTITION BY {all_proj_cols}"
@@ -977,58 +1065,28 @@ def _compile_join(
         f")"
     )
 
-    # --- INSERT: (ΔR ⋈ S) ∪ (R ⋈ ΔS) - (ΔR ⋈ ΔS) ---
-    col_list = ", ".join(out_col_names)
+    # INSERT SQL
+    ins_cte_defs = _build_delta_sql(ins_positive, ins_negative, "_all_inserts")
+    ins_ctes_sql = ",\n".join(ins_cte_defs)
     insert_sql = (
-        f"WITH {changes_l},\n"
-        f"{changes_r},\n"
-        f"_ins_from_l AS (\n"
-        f"    SELECT {proj_dl_s}\n"
-        f"    FROM _changes_l AS _dl\n"
-        f"    JOIN {right_fqn} AS {right_name} ON {on_dl_sql}\n"
-        f"    WHERE _dl.change_type IN ('insert', 'update_postimage')\n"
-        f"),\n"
-        f"_ins_from_r AS (\n"
-        f"    SELECT {proj_r_dr}\n"
-        f"    FROM {left_fqn} AS {left_name}\n"
-        f"    JOIN _changes_r AS _dr ON {on_dr_sql}\n"
-        f"    WHERE _dr.change_type IN ('insert', 'update_postimage')\n"
-        f"),\n"
-        f"_ins_cross AS (\n"
-        f"    SELECT {proj_cross}\n"
-        f"    FROM _changes_l AS _dl\n"
-        f"    JOIN _changes_r AS _dr ON {on_cross_sql}\n"
-        f"    WHERE _dl.change_type IN ('insert', 'update_postimage')\n"
-        f"    AND _dr.change_type IN ('insert', 'update_postimage')\n"
-        f"),\n"
-        f"_all_inserts AS (\n"
-        f"    SELECT * FROM _ins_from_l\n"
-        f"    UNION ALL\n"
-        f"    SELECT * FROM _ins_from_r\n"
-        f"    EXCEPT ALL\n"
-        f"    SELECT * FROM _ins_cross\n"
-        f")\n"
+        f"WITH {changes_cte_sql},\n"
+        f"{ins_ctes_sql}\n"
         f"INSERT INTO {mv_fqn} ({col_list})\n"
         f"SELECT * FROM _all_inserts"
     )
 
     # --- Update cursors ---
-    update_cursor_l = _gen_update_cursor(cursors_fqn, mv_table, left_src)
-    update_cursor_r = _gen_update_cursor(cursors_fqn, mv_table, right_src)
-
-    maintain = [
-        *set_vars_left,
-        *set_vars_right,
-        delete_sql,
-        insert_sql,
-        update_cursor_l,
-        update_cursor_r,
+    update_cursors = [
+        _gen_update_cursor(cursors_fqn, mv_table, table_sources[tname])
+        for tname in table_names_ordered
     ]
+
+    maintain = [*all_set_vars, delete_sql, insert_sql, *update_cursors]
 
     features = _detect_features(ast)
     features.add("join")
 
-    base_tables = {left_name: left_src["catalog"], right_name: right_src["catalog"]}
+    base_tables = {tname: table_sources[tname]["catalog"] for tname in table_names_ordered}
 
     return IVMPlan(
         view_sql=ast.sql(dialect=dialect),
@@ -1039,6 +1097,27 @@ def _compile_join(
         base_tables=base_tables,
         features=features,
     )
+
+
+def _subsets_of_size(items: list[str], size: int) -> list[list[str]]:
+    """Generate all subsets of the given size from items."""
+    if size == 0:
+        return [[]]
+    if size > len(items):
+        return []
+    result: list[list[str]] = []
+
+    def _backtrack(start: int, current: list[str]):
+        if len(current) == size:
+            result.append(list(current))
+            return
+        for i in range(start, len(items)):
+            current.append(items[i])
+            _backtrack(i + 1, current)
+            current.pop()
+
+    _backtrack(0, [])
+    return result
 
 
 # ---------------------------------------------------------------------------
