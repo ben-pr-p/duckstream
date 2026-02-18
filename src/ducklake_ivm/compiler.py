@@ -450,7 +450,7 @@ def _gen_select_maintenance(
 
 AggInfo = list[tuple[str, str, str | None, bool]]
 # Each entry: (alias, agg_type, inner_col_name, is_avg)
-# agg_type is one of: "SUM", "COUNT_STAR", "COUNT_COL", "AVG"
+# agg_type is one of: "SUM", "COUNT_STAR", "COUNT_COL", "AVG", "MIN", "MAX"
 
 
 def _analyze_aggregates(ast: exp.Select, dialect: str) -> tuple[list[str], AggInfo]:
@@ -482,6 +482,12 @@ def _analyze_aggregates(ast: exp.Select, dialect: str) -> tuple[list[str], AggIn
         elif isinstance(inner, exp.Avg):
             col_name = inner.this.name if isinstance(inner.this, exp.Column) else inner.this.sql()
             agg_info.append((alias_name or col_name, "AVG", col_name, True))
+        elif isinstance(inner, exp.Min):
+            col_name = inner.this.name if isinstance(inner.this, exp.Column) else inner.this.sql()
+            agg_info.append((alias_name or col_name, "MIN", col_name, False))
+        elif isinstance(inner, exp.Max):
+            col_name = inner.this.name if isinstance(inner.this, exp.Column) else inner.this.sql()
+            agg_info.append((alias_name or col_name, "MAX", col_name, False))
 
     return group_col_names, agg_info
 
@@ -509,16 +515,22 @@ def _gen_agg_exprs(
             sum_col = naming.aux_column(f"sum_{alias}")
             ins_parts.append(f"SUM({src_alias}.{col_name}) AS _ins_{sum_col}")
             del_parts.append(f"SUM({src_alias}.{col_name}) AS _del_{sum_col}")
+        elif agg_type == "MIN":
+            ins_parts.append(f"MIN({src_alias}.{col_name}) AS _ins_{alias}")
+            del_parts.append(f"MIN({src_alias}.{col_name}) AS _del_{alias}")
+        elif agg_type == "MAX":
+            ins_parts.append(f"MAX({src_alias}.{col_name}) AS _ins_{alias}")
+            del_parts.append(f"MAX({src_alias}.{col_name}) AS _del_{alias}")
     ins_parts.append("COUNT(*) AS _ins_cnt")
     del_parts.append("COUNT(*) AS _del_cnt")
     return ins_parts, del_parts
 
 
-def _gen_agg_net_sql(agg_info: AggInfo, naming: Naming) -> tuple[str, str, str]:
-    """Build COALESCE net expressions and FULL OUTER JOIN condition.
+def _gen_agg_net_sql(agg_info: AggInfo, naming: Naming) -> str:
+    """Build COALESCE net expressions for the delta_agg SELECT.
 
-    Returns (coalesce_group_sql, net_sql, join_cond) — but group cols
-    must be supplied externally since they depend on context.
+    For SUM/COUNT/AVG: computes _net_X = ins - del.
+    For MIN/MAX: passes through _ins_X and _del_X separately (no subtraction).
     """
     net_parts = []
     for alias, agg_type, _col_name, _is_avg in agg_info:
@@ -531,6 +543,9 @@ def _gen_agg_net_sql(agg_info: AggInfo, naming: Naming) -> tuple[str, str, str]:
             net_parts.append(
                 f"COALESCE(i._ins_{sum_col}, 0) - COALESCE(d._del_{sum_col}, 0) AS _net_{sum_col}"
             )
+        elif agg_type in ("MIN", "MAX"):
+            net_parts.append(f"i._ins_{alias} AS _ins_{alias}")
+            net_parts.append(f"d._del_{alias} AS _del_{alias}")
     net_parts.append("COALESCE(i._ins_cnt, 0) - COALESCE(d._del_cnt, 0) AS _net_count")
     return ", ".join(net_parts)
 
@@ -540,17 +555,19 @@ def _gen_agg_mv_updates(
     group_col_names: list[str],
     mv_fqn: str,
     naming: Naming,
+    src_fqn: str | None = None,
 ) -> tuple[str, str, str, str]:
     """Generate UPDATE/INSERT/DELETE/DROP for aggregate MV maintenance.
 
     Assumes _delta_agg temp table exists with _net_* columns.
+    For MIN/MAX, src_fqn is required for rescan fallback.
     Returns (update_existing, insert_new, delete_empty, drop_delta).
     """
     ivm_count_col = naming.aux_column("count")
 
     # UPDATE existing groups
     update_sets = []
-    for alias, agg_type, _col_name, _is_avg in agg_info:
+    for alias, agg_type, col_name, _is_avg in agg_info:
         if agg_type in ("SUM", "COUNT_STAR", "COUNT_COL"):
             update_sets.append(f"{alias} = mv.{alias} + d._net_{alias}")
         elif agg_type == "AVG":
@@ -559,6 +576,34 @@ def _gen_agg_mv_updates(
             update_sets.append(
                 f"{alias} = CAST(mv.{sum_col} + d._net_{sum_col} AS DOUBLE) "
                 f"/ (mv.{ivm_count_col} + d._net_count)"
+            )
+        elif agg_type == "MIN":
+            assert src_fqn is not None, "src_fqn required for MIN rescan"
+            group_match = " AND ".join(
+                f"src.{g} IS NOT DISTINCT FROM mv.{g}" for g in group_col_names
+            )
+            update_sets.append(
+                f"{alias} = CASE"
+                f" WHEN d._del_{alias} IS NOT NULL"
+                f" AND d._del_{alias} IS NOT DISTINCT FROM mv.{alias}"
+                f" THEN (SELECT MIN({col_name}) FROM {src_fqn} src"
+                f" WHERE {group_match})"
+                f" ELSE LEAST(mv.{alias}, COALESCE(d._ins_{alias}, mv.{alias}))"
+                f" END"
+            )
+        elif agg_type == "MAX":
+            assert src_fqn is not None, "src_fqn required for MAX rescan"
+            group_match = " AND ".join(
+                f"src.{g} IS NOT DISTINCT FROM mv.{g}" for g in group_col_names
+            )
+            update_sets.append(
+                f"{alias} = CASE"
+                f" WHEN d._del_{alias} IS NOT NULL"
+                f" AND d._del_{alias} IS NOT DISTINCT FROM mv.{alias}"
+                f" THEN (SELECT MAX({col_name}) FROM {src_fqn} src"
+                f" WHERE {group_match})"
+                f" ELSE GREATEST(mv.{alias}, COALESCE(d._ins_{alias}, mv.{alias}))"
+                f" END"
             )
     update_sets.append(f"{ivm_count_col} = mv.{ivm_count_col} + d._net_count")
     update_sets_sql = ", ".join(update_sets)
@@ -580,6 +625,9 @@ def _gen_agg_mv_updates(
             insert_vals.append(f"d._net_{sum_col}")
             insert_cols.append(alias)
             insert_vals.append(f"CAST(d._net_{sum_col} AS DOUBLE) / d._net_count")
+        elif agg_type in ("MIN", "MAX"):
+            insert_cols.append(alias)
+            insert_vals.append(f"d._ins_{alias}")
     insert_cols.append(ivm_count_col)
     insert_vals.append("d._net_count")
     not_exists_where = " AND ".join(f"mv.{g} IS NOT DISTINCT FROM d.{g}" for g in group_col_names)
@@ -653,8 +701,9 @@ def _gen_aggregate_maintenance(
     )
 
     # Steps 2-5: UPDATE/INSERT/DELETE/DROP
+    src_fqn = f"{src['catalog']}.{src['schema']}.{src['table']}"
     update_existing, insert_new, delete_empty, drop_delta = _gen_agg_mv_updates(
-        agg_info, group_col_names, mv_fqn, naming
+        agg_info, group_col_names, mv_fqn, naming, src_fqn=src_fqn
     )
 
     update_cursor = _gen_update_cursor(cursors_fqn, mv_table, src)
@@ -1021,6 +1070,11 @@ def _compile_join_aggregate(
     if len(joins) != 1:
         raise UnsupportedSQLError("multi_join", "Only two-table joins supported")
 
+    # MIN/MAX with JOIN is not yet supported (rescan would need to join both tables)
+    for agg in ast.find_all(exp.AggFunc):
+        if isinstance(agg, (exp.Min, exp.Max)):
+            raise UnsupportedSQLError("join_min_max", "MIN/MAX with JOIN is not yet supported")
+
     join_node = joins[0]
     left_table_node = ast.args["from_"].this
     right_table_node = join_node.this
@@ -1303,4 +1357,8 @@ def _detect_features(ast: exp.Select) -> set[str]:
             features.add("count")
         elif isinstance(agg, exp.Avg):
             features.add("avg")
+        elif isinstance(agg, exp.Min):
+            features.add("min")
+        elif isinstance(agg, exp.Max):
+            features.add("max")
     return features

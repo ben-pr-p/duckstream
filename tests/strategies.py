@@ -210,7 +210,7 @@ def single_table_aggregate(draw):
 
     initial_rows = draw(rows_for_table(table, min_size=2, max_size=15))
 
-    agg_func = draw(st.sampled_from(["SUM", "COUNT", "AVG"]))
+    agg_func = draw(st.sampled_from(["SUM", "COUNT", "AVG", "MIN", "MAX"]))
     agg_expr = f"{agg_func}({agg_name})" if agg_func != "COUNT" else "COUNT(*)"
 
     view_sql = f"SELECT {group_name}, {agg_expr} AS agg_val FROM {tname} GROUP BY {group_name}"
