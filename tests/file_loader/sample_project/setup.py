@@ -22,7 +22,11 @@ def secrets(conn: duckdb.DuckDBPyConnection) -> None:
 
 def catalogs() -> list:
     """Return a list of attach functions. Each function's name is the catalog name."""
-    data_dir = os.environ["DUCKSTREAM_TEST_DATA_DIR"]
+    data_dir = (
+        os.environ["DUCKSTREAM_TEST_DATA_DIR"]
+        if "DUCKSTREAM_TEST_DATA_DIR" in os.environ
+        else "./data"
+    )
     meta_path = os.path.join(data_dir, "dl_meta.ddb")
     dl_data_path = os.path.join(data_dir, "dl_data")
     os.makedirs(dl_data_path, exist_ok=True)

@@ -72,7 +72,7 @@ SELECT * FROM ducklake_table_changes('dl', 'main', 't', 3, 7)
 ## Step 0: Dataclasses and Module Structure
 
 **Files to create/modify:**
-- `src/duckstream/plan.py` — new file for `IVMPlan` and `Naming`
+- `src/duckstream/plan.py` — new file for `MaterializedView` and `Naming`
 - `src/duckstream/__init__.py` — re-export public API
 - `src/duckstream/compiler.py` — update signature
 
@@ -94,7 +94,7 @@ class Naming:
 
 
 @dataclass
-class IVMPlan:
+class MaterializedView:
     view_sql: str
     create_cursors_table: str
     create_mv: str
@@ -114,7 +114,7 @@ class UnsupportedSQLError(Exception):
 ### `src/duckstream/__init__.py`
 
 ```python
-from duckstream.plan import IVMPlan, Naming, UnsupportedSQLError
+from duckstream.plan import MaterializedView, Naming, UnsupportedSQLError
 from duckstream.compiler import compile_ivm
 ```
 
@@ -129,12 +129,12 @@ def compile_ivm(
     mv_catalog: str = "dl",
     mv_schema: str = "main",
     sources: dict[str, dict] | None = None,
-) -> IVMPlan:
+) -> MaterializedView:
 ```
 
 ### Update test harness
 
-The test harness currently calls `compile_ivm(scenario.view_sql, dialect="duckdb")` and expects `ivm_output.maintain`. After Step 0 the return type changes from `dict` to `IVMPlan`, but the test already accesses `.maintain` — so this is compatible. We need to update the call to pass `mv_catalog`:
+The test harness currently calls `compile_ivm(scenario.view_sql, dialect="duckdb")` and expects `ivm_output.maintain`. After Step 0 the return type changes from `dict` to `MaterializedView`, but the test already accesses `.maintain` — so this is compatible. We need to update the call to pass `mv_catalog`:
 
 ```python
 ivm_output = compile_ivm(
@@ -401,7 +401,7 @@ def compile_ivm(view_sql, *, dialect="duckdb", naming=None, mv_catalog="dl",
             ast, mv_fqn, cursors_fqn, mv_table, src, proj_col_names, dialect
         )
 
-    return IVMPlan(
+    return MaterializedView(
         view_sql=ast.sql(dialect=dialect),
         create_cursors_table=create_cursors,
         create_mv=create_mv,
@@ -615,10 +615,10 @@ def get_non_aux_columns(con, catalog, plan):
 ## Step 4: Implementation Order
 
 ### Phase 1: Infrastructure (Step 0)
-1. Create `src/duckstream/plan.py` with `IVMPlan`, `Naming`, `UnsupportedSQLError`
+1. Create `src/duckstream/plan.py` with `MaterializedView`, `Naming`, `UnsupportedSQLError`
 2. Update `src/duckstream/__init__.py` to re-export
 3. Update `src/duckstream/compiler.py` with new signature (still raises `NotImplementedError`)
-4. Update `tests/test_ivm.py` to use the new `IVMPlan` protocol in `assert_ivm_correct`
+4. Update `tests/test_ivm.py` to use the new `MaterializedView` protocol in `assert_ivm_correct`
 5. Verify tests still fail with `NotImplementedError`
 
 ### Phase 2: Stage 1 — SELECT/WHERE
@@ -660,7 +660,7 @@ def get_non_aux_columns(con, catalog, plan):
 1. Handle edge cases found by Hypothesis
 2. Handle NULL values in projections (NULL = NULL matching for deletes)
 3. Handle empty delta ranges (no-op maintenance)
-4. Add `features` detection to `IVMPlan`
+4. Add `features` detection to `MaterializedView`
 
 ### Quality gates (every phase)
 1. `uv run ruff check src/ tests/` — all linting passes

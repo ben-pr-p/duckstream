@@ -29,7 +29,7 @@ Read these before working on the codebase:
 - **bag-algebra-vs-z-sets.md** — why classical bag algebra (not DBSP Z-sets) is the right model; contains all delta rules and SQL patterns
 - **PLAN.md** — concrete implementation plan with exact code patterns, SQL templates, and sqlglot API usage for each stage
 - **EVOLUTION.md** — stage-by-stage roadmap (Stage 1: SELECT/WHERE through Stage 10: set operations) with test strategies and done criteria
-- **REQUIREMENTS.md** — Python API specification (`compile_ivm()`, `IVMPlan`, `Naming`, snapshot cursors, cross-catalog support)
+- **REQUIREMENTS.md** — Python API specification (`compile_ivm()`, `MaterializedView`, `Naming`, snapshot cursors, cross-catalog support)
 - **CODEBASE.md** — project layout, key concepts, delta rule summary, test architecture
 
 ## Architecture

@@ -11,3 +11,6 @@ wheels/
 
 # Hypothesis test database
 .hypothesis/
+
+# Local DuckLake data
+data/

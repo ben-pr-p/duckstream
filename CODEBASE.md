@@ -15,7 +15,7 @@ duckstream/
 │
 ├── src/duckstream/                 # Library source
 │   ├── __init__.py                 # Package root (public API re-exports)
-│   ├── plan.py                     # IVMPlan, Naming, UnsupportedSQLError dataclasses
+│   ├── plan.py                     # MaterializedView, Naming, UnsupportedSQLError dataclasses
 │   ├── utils.py                    # safe_to_expire_sql(), pending_maintenance_sql()
 │   └── compiler/                   # Core compiler modules
 │       ├── __init__.py             # Package root
@@ -79,10 +79,10 @@ Managed by **uv**. Python 3.13+.
 The library's public API is a single function:
 
 ```python
-compile_ivm(view_sql, *, dialect, naming, mv_catalog, mv_schema, sources) -> IVMPlan
+compile_ivm(view_sql, *, dialect, naming, mv_catalog, mv_schema, sources) -> MaterializedView
 ```
 
-It takes a SQL SELECT statement and returns an `IVMPlan` dataclass containing:
+It takes a SQL SELECT statement and returns an `MaterializedView` dataclass containing:
 - `create_cursors_table` — DDL for the shared snapshot cursor tracking table
 - `create_mv` — DDL to create and populate the materialized view
 - `initialize_cursors` — DML to set initial cursor positions
@@ -205,7 +205,7 @@ uv run pytest -n auto                          # parallel execution
 All 10 stages from EVOLUTION.md are complete, plus:
 - **HAVING** support — MV stores all groups, `query_mv` filters at read time
 - **Utility functions** — `safe_to_expire_sql()` and `pending_maintenance_sql()`
-- **`query_mv`** field on `IVMPlan` — SELECT query for reading the MV (excludes auxiliary columns, applies HAVING)
+- **`query_mv`** field on `MaterializedView` — SELECT query for reading the MV (excludes auxiliary columns, applies HAVING)
 
 See `EVOLUTION.md` for the stage-by-stage plan and future/deferred features.
 
@@ -214,7 +214,7 @@ See `EVOLUTION.md` for the stage-by-stage plan and future/deferred features.
 | File | Contents |
 |------|----------|
 | `bag-algebra-vs-z-sets.md` | Why classical bag algebra (not DBSP Z-sets) is the right model — delta rules, SQL patterns, algorithmic complexity |
-| `REQUIREMENTS.md` | Python API specification: `compile_ivm()`, `IVMPlan`, `Naming`, snapshot cursors, cross-catalog support, `safe_to_expire_sql()`, `pending_maintenance_sql()`, error handling, full workflow examples |
+| `REQUIREMENTS.md` | Python API specification: `compile_ivm()`, `MaterializedView`, `Naming`, snapshot cursors, cross-catalog support, `safe_to_expire_sql()`, `pending_maintenance_sql()`, error handling, full workflow examples |
 | `EVOLUTION.md` | Implementation roadmap: 10 stages from simple SELECT through set operations, testing philosophy, per-stage compiler work + test strategies + done criteria |
 | `PLAN.md` | Concrete implementation plan with exact SQL patterns, sqlglot API usage |
 | `CODEBASE.md` | This file: project layout, key concepts, test architecture, implementation status |

@@ -12,7 +12,7 @@ An optional execution helper may be added later as a separate module.
 
 ## Core API
 
-### `compile_ivm(view_sql, *, dialect, naming, mv_catalog, mv_schema, sources) -> IVMPlan`
+### `compile_ivm(view_sql, *, dialect, naming, mv_catalog, mv_schema, sources) -> MaterializedView`
 
 The single entry point. Takes a view definition (a SELECT statement as a string) and returns a structured plan containing all the SQL needed to create and maintain the materialized view.
 
@@ -84,13 +84,13 @@ class MyNaming(Naming):
 plan = compile_ivm(view_sql, naming=MyNaming())
 ```
 
-### `IVMPlan`
+### `MaterializedView`
 
 The output dataclass. All SQL strings are ready to execute in the target dialect.
 
 ```python
 @dataclass
-class IVMPlan:
+class MaterializedView:
     """Complete set of SQL statements for IVM maintenance."""
 
     # The original view SQL, normalized by sqlglot
@@ -470,7 +470,7 @@ for stmt in plan.maintain:
 
 ## Design Principles
 
-1. **Pure compiler.** No side effects, no connections, no state. Given the same inputs, `compile_ivm` always returns the same `IVMPlan`.
+1. **Pure compiler.** No side effects, no connections, no state. Given the same inputs, `compile_ivm` always returns the same `MaterializedView`.
 
 2. **Correct or loud.** The compiler either produces correct maintenance SQL or raises `UnsupportedSQLError`. No silent incorrectness.
 

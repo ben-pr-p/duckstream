@@ -5,12 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "click>=8.1",
     "duckdb>=1.4.4",
-    "hypothesis>=6.151.9",
-    "pytest>=9.0.2",
     "pytz>=2025.2",
     "sqlglot>=28.10.1",
+    "textual>=3.0",
+    "watchfiles>=1.0",
 ]
+
+[project.scripts]
+duckstream = "duckstream.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -31,6 +35,8 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.151.9",
+    "pytest>=9.0.2",
     "ruff>=0.15.1",
     "ty>=0.0.17",
 ]
