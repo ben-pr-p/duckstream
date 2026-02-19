@@ -178,7 +178,6 @@ def assert_ivm_correct(scenario: Scenario, ducklake_fixture):
     # 2. Compile IVM
     plan = compile_ivm(
         scenario.view_sql,
-        dialect="duckdb",
         mv_catalog=catalog,
     )
 

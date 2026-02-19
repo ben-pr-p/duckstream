@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from sqlglot import exp
 
-from duckstream.plan import Naming
+from duckstream.materialized_view import Naming
 
 
 def _resolve_source(

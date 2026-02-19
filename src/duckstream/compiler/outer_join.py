@@ -16,7 +16,7 @@ from duckstream.compiler.infrastructure import (
     _gen_update_cursor,
     _resolve_source,
 )
-from duckstream.plan import IVMPlan, Naming, UnsupportedSQLError
+from duckstream.materialized_view import MaterializedView, Naming, UnsupportedSQLError
 
 
 def _compile_outer_join(
@@ -32,7 +32,7 @@ def _compile_outer_join(
     mv_fqn: str,
     cursors_fqn: str,
     create_cursors: str,
-) -> IVMPlan:
+) -> MaterializedView:
     """Compile a two-table outer join view (LEFT/RIGHT/FULL).
 
     Uses key-scoped recomputation: for each affected join key in the delta,
@@ -207,7 +207,7 @@ def _compile_outer_join(
 
     query_mv = _gen_query_mv(ast, mv_fqn, naming, dialect)
 
-    return IVMPlan(
+    return MaterializedView(
         view_sql=ast.sql(dialect=dialect),
         create_cursors_table=create_cursors,
         create_mv=create_mv,

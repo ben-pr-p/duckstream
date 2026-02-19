@@ -16,7 +16,7 @@ from duckstream.compiler.infrastructure import (
     _resolve_source,
     _subsets_of_size,
 )
-from duckstream.plan import IVMPlan, Naming
+from duckstream.materialized_view import MaterializedView, Naming
 
 
 def _compile_join(
@@ -32,7 +32,7 @@ def _compile_join(
     mv_fqn: str,
     cursors_fqn: str,
     create_cursors: str,
-) -> IVMPlan:
+) -> MaterializedView:
     """Compile an N-table inner join view (2+ tables).
 
     Uses inclusion-exclusion to compute the join delta:
@@ -302,7 +302,7 @@ def _compile_join(
 
     query_mv = _gen_query_mv(ast, mv_fqn, naming, dialect)
 
-    return IVMPlan(
+    return MaterializedView(
         view_sql=ast.sql(dialect=dialect),
         create_cursors_table=create_cursors,
         create_mv=create_mv,

@@ -21,7 +21,7 @@ from duckstream.compiler.infrastructure import (
     _gen_update_cursor,
     _resolve_source,
 )
-from duckstream.plan import IVMPlan, Naming, UnsupportedSQLError
+from duckstream.materialized_view import MaterializedView, Naming, UnsupportedSQLError
 
 
 def _compile_join_aggregate(
@@ -37,7 +37,7 @@ def _compile_join_aggregate(
     mv_fqn: str,
     cursors_fqn: str,
     create_cursors: str,
-) -> IVMPlan:
+) -> MaterializedView:
     """Compile a two-table inner join + aggregate view.
 
     Composes join delta decomposition with aggregate maintenance:
@@ -293,7 +293,7 @@ def _compile_join_aggregate(
 
     query_mv = _gen_query_mv(ast, mv_fqn, naming, dialect)
 
-    return IVMPlan(
+    return MaterializedView(
         view_sql=ast.sql(dialect=dialect),
         create_cursors_table=create_cursors,
         create_mv=create_mv,

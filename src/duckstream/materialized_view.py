@@ -15,7 +15,7 @@ class Naming:
 
 
 @dataclass
-class IVMPlan:
+class MaterializedView:
     """Complete set of SQL statements for IVM maintenance."""
 
     view_sql: str

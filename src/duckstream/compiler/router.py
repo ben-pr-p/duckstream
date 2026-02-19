@@ -25,19 +25,19 @@ from duckstream.compiler.join_aggregate import _compile_join_aggregate
 from duckstream.compiler.outer_join import _compile_outer_join
 from duckstream.compiler.select import _gen_select_maintenance
 from duckstream.compiler.set_ops import _compile_set_operation
-from duckstream.plan import IVMPlan, Naming, UnsupportedSQLError
+from duckstream.materialized_view import MaterializedView, Naming, UnsupportedSQLError
 
 
 def compile_ivm(
     view_sql: str,
     *,
-    dialect: str = "duckdb",
     naming: Naming | None = None,
     mv_catalog: str = "dl",
     mv_schema: str = "main",
     sources: dict[str, dict] | None = None,
-) -> IVMPlan:
+) -> MaterializedView:
     """Compile a view definition into IVM maintenance SQL."""
+    dialect = "duckdb"
     naming = naming or Naming()
     parsed = sqlglot.parse_one(view_sql, dialect=dialect)
 
@@ -135,7 +135,7 @@ def compile_ivm(
     features = _detect_features(ast)
     query_mv = _gen_query_mv(ast, mv_fqn, naming, dialect)
 
-    return IVMPlan(
+    return MaterializedView(
         view_sql=ast.sql(dialect=dialect),
         create_cursors_table=create_cursors,
         create_mv=create_mv,

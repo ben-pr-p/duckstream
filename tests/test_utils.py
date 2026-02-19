@@ -1,7 +1,7 @@
 """Tests for utility functions (safe_to_expire_sql, pending_maintenance_sql)."""
 
 from duckstream import pending_maintenance_sql, safe_to_expire_sql
-from duckstream.plan import Naming
+from duckstream.materialized_view import Naming
 
 
 class TestSafeToExpireSql:

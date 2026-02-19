@@ -18,7 +18,7 @@ from duckstream.compiler.infrastructure import (
     _gen_where_clause,
     _repoint_columns_to_delta,
 )
-from duckstream.plan import Naming
+from duckstream.materialized_view import Naming
 
 
 def _gen_distinct_maintenance(

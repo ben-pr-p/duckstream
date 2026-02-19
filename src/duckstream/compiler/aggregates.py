@@ -10,7 +10,7 @@ from duckstream.compiler.infrastructure import (
     _gen_update_cursor,
     _gen_where_clause,
 )
-from duckstream.plan import Naming
+from duckstream.materialized_view import Naming
 
 AggInfo = list[tuple[str, str, str | None, bool]]
 # Each entry: (alias, agg_type, inner_col_name, is_avg)

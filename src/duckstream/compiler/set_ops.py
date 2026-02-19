@@ -14,7 +14,7 @@ from duckstream.compiler.infrastructure import (
     _repoint_columns_to_delta,
     _resolve_source,
 )
-from duckstream.plan import IVMPlan, Naming, UnsupportedSQLError
+from duckstream.materialized_view import MaterializedView, Naming, UnsupportedSQLError
 
 
 def _flatten_set_op(node: exp.Expression, op_type: type) -> list[exp.Select]:
@@ -41,7 +41,7 @@ def _compile_set_operation(
     sources: dict[str, dict] | None,
     mv_catalog: str,
     mv_schema: str,
-) -> IVMPlan:
+) -> MaterializedView:
     """Compile a set operation (UNION/EXCEPT/INTERSECT) into IVM maintenance SQL.
 
     Each branch must be a simple SELECT ... FROM table [WHERE ...].
@@ -222,7 +222,7 @@ def _compile_union_all(
     sources: dict[str, dict] | None,
     mv_catalog: str,
     mv_schema: str,
-) -> IVMPlan:
+) -> MaterializedView:
     """UNION ALL: delta of union = union of deltas. Each branch independently."""
     # --- CREATE MV ---
     qualified_branches = [
@@ -302,7 +302,7 @@ def _compile_union_all(
     cols_sql = ", ".join(visible_cols) if visible_cols else "*"
     query_mv = f"SELECT {cols_sql} FROM {mv_fqn}"
 
-    return IVMPlan(
+    return MaterializedView(
         view_sql=ast.sql(dialect=dialect),
         create_cursors_table=create_cursors,
         create_mv=create_mv,
@@ -329,7 +329,7 @@ def _compile_union_distinct(
     sources: dict[str, dict] | None,
     mv_catalog: str,
     mv_schema: str,
-) -> IVMPlan:
+) -> MaterializedView:
     """UNION DISTINCT: maintain multiplicity via _ivm_count."""
     count_col = naming.aux_column("count")
 
@@ -432,7 +432,7 @@ def _compile_union_distinct(
     cols_sql = ", ".join(visible_cols) if visible_cols else "*"
     query_mv = f"SELECT {cols_sql} FROM {mv_fqn}"
 
-    return IVMPlan(
+    return MaterializedView(
         view_sql=ast.sql(dialect=dialect),
         create_cursors_table=create_cursors,
         create_mv=create_mv,
@@ -461,7 +461,7 @@ def _compile_bag_set_op(
     mv_schema: str,
     op_keyword: str,
     feature_name: str,
-) -> IVMPlan:
+) -> MaterializedView:
     """EXCEPT ALL / INTERSECT ALL via key-scoped recomputation."""
     left_branch, right_branch = branches
     left_src, right_src = branch_sources
@@ -557,7 +557,7 @@ def _compile_bag_set_op(
     cols_sql = ", ".join(visible_cols) if visible_cols else "*"
     query_mv = f"SELECT {cols_sql} FROM {mv_fqn}"
 
-    return IVMPlan(
+    return MaterializedView(
         view_sql=ast.sql(dialect=dialect),
         create_cursors_table=create_cursors,
         create_mv=create_mv,
@@ -584,7 +584,7 @@ def _compile_except_all(
     sources: dict[str, dict] | None,
     mv_catalog: str,
     mv_schema: str,
-) -> IVMPlan:
+) -> MaterializedView:
     """EXCEPT ALL via key-scoped recomputation."""
     return _compile_bag_set_op(
         ast,
@@ -621,7 +621,7 @@ def _compile_intersect_all(
     sources: dict[str, dict] | None,
     mv_catalog: str,
     mv_schema: str,
-) -> IVMPlan:
+) -> MaterializedView:
     """INTERSECT ALL via key-scoped recomputation."""
     return _compile_bag_set_op(
         ast,
