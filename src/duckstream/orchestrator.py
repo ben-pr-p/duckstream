@@ -110,6 +110,34 @@ class Orchestrator:
         self._executor: ThreadPoolExecutor | None = None
         self._advance_state: _AdvanceState | None = None
 
+        # DuckLake is always required
+        self._conn.execute("INSTALL ducklake")
+        self._conn.execute("LOAD ducklake")
+
+    # -- Extensions & secrets ------------------------------------------------
+
+    def setup_extensions(
+        self,
+        fn: Callable[[duckdb.DuckDBPyConnection], None],
+    ) -> None:
+        """Install/load additional DuckDB extensions.
+
+        Called with the orchestrator's connection so the user can run
+        INSTALL/LOAD statements for any extensions needed by their catalogs.
+        """
+        fn(self._conn)
+
+    def setup_secrets(
+        self,
+        fn: Callable[[duckdb.DuckDBPyConnection], None],
+    ) -> None:
+        """Configure DuckDB secrets (e.g. S3 credentials).
+
+        Called with the orchestrator's connection so the user can run
+        CREATE SECRET statements.
+        """
+        fn(self._conn)
+
     # -- Catalog management --------------------------------------------------
 
     def add_catalog(

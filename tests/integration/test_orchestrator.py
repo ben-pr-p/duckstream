@@ -25,8 +25,6 @@ def _make_ducklake_attach(tmpdir: str):
     os.makedirs(data_path, exist_ok=True)
 
     def attach(conn: duckdb.DuckDBPyConnection, name: str) -> None:
-        conn.execute("INSTALL ducklake")
-        conn.execute("LOAD ducklake")
         conn.execute(f"ATTACH 'ducklake:{meta_path}' AS {name} (DATA_PATH '{data_path}')")
 
     return attach

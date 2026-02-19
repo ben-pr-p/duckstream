@@ -1,4 +1,5 @@
 from duckstream.compiler import compile_ivm
+from duckstream.file_loader import FileLoaderError, load_directory
 from duckstream.materialized_view import MaterializedView, Naming, UnsupportedSQLError
 from duckstream.orchestrator import (
     MaintenancePlan,
@@ -9,6 +10,7 @@ from duckstream.orchestrator import (
 from duckstream.utils import pending_maintenance_sql, safe_to_expire_sql
 
 __all__ = [
+    "FileLoaderError",
     "MaintenancePlan",
     "MaintenanceStep",
     "MaterializedView",
@@ -17,6 +19,7 @@ __all__ = [
     "OrchestratorError",
     "UnsupportedSQLError",
     "compile_ivm",
+    "load_directory",
     "pending_maintenance_sql",
     "safe_to_expire_sql",
 ]
