@@ -18,6 +18,8 @@ import duckdb
 
 from duckstream.compiler import compile_ivm
 from duckstream.materialized_view import MaterializedView, Naming
+from duckstream.sinks.base import ChangeSet, FlushResult, Sink
+from duckstream.sources.base import Source, SyncResult
 
 if TYPE_CHECKING:
     pass
@@ -108,6 +110,9 @@ class Orchestrator:
         self._naming = naming or Naming()
         self._catalogs: dict[str, Callable[[duckdb.DuckDBPyConnection, str], None]] = {}
         self._mvs: dict[str, _RegisteredMV] = {}  # keyed by fqn
+        self._sources: list[Source] = []
+        self._sinks: list[Sink] = []
+        self._sink_cursors: dict[str, int] = {}  # in-memory cache, persisted to DuckLake
         self._executor: ThreadPoolExecutor | None = None
         self._advance_state: _AdvanceState | None = None
 
@@ -138,6 +143,86 @@ class Orchestrator:
         CREATE SECRET statements.
         """
         fn(self._conn)
+
+    # -- Source management ---------------------------------------------------
+
+    def add_source(self, source: Source) -> None:
+        """Register a source plugin."""
+        self._sources.append(source)
+
+    def sync_sources(self) -> list[SyncResult]:
+        """Sync all registered sources. Returns list of SyncResults."""
+        results: list[SyncResult] = []
+        for source in self._sources:
+            results.append(source.sync(self._conn))
+        return results
+
+    # -- Sink management ----------------------------------------------------
+
+    def add_sink(self, sink: Sink) -> None:
+        """Register a sink plugin."""
+        self._sinks.append(sink)
+
+    def flush_sinks(self) -> list[FlushResult]:
+        """Flush all registered sinks. Returns list of FlushResults.
+
+        Uses an in-memory cursor cache for skip detection (avoiding the
+        DuckLake self-referential snapshot problem where writing the cursor
+        table creates a new snapshot).  Persists cursors to the DuckLake
+        ``_sink_cursors`` table after each flush so they survive restarts.
+        """
+        results: list[FlushResult] = []
+        for sink in self._sinks:
+            last_snapshot = self._sink_cursors.get(sink.sink_name, 0)
+
+            latest = self._conn.execute(
+                f"SELECT MAX(snapshot_id) FROM ducklake_snapshots('{sink.catalog}')"
+            ).fetchone()
+            latest_snapshot = latest[0] if latest and latest[0] is not None else 0
+
+            if latest_snapshot <= last_snapshot:
+                results.append(FlushResult())
+                continue
+
+            if sink.batched:
+                changes = ChangeSet(
+                    catalog=sink.catalog,
+                    schema=sink.schema_,
+                    table=sink.table,
+                    conn=self._conn,
+                    snapshot_start=last_snapshot + 1,
+                    snapshot_end=latest_snapshot,
+                )
+                results.append(sink.flush(changes))
+                self._sink_cursors[sink.sink_name] = latest_snapshot
+            else:
+                for snap in range(last_snapshot + 1, latest_snapshot + 1):
+                    changes = ChangeSet(
+                        catalog=sink.catalog,
+                        schema=sink.schema_,
+                        table=sink.table,
+                        conn=self._conn,
+                        snapshot_start=snap,
+                        snapshot_end=snap,
+                    )
+                    results.append(sink.flush(changes))
+                    self._sink_cursors[sink.sink_name] = snap
+
+            # Persist cursor to DuckLake for restart recovery.
+            # The UPDATE creates a new DuckLake snapshot, so we read the new
+            # max afterward and update the in-memory cache to include it.
+            cursors_fqn = f"{sink.catalog}.{sink.schema_}._sink_cursors"
+            self._conn.execute(
+                f"UPDATE {cursors_fqn} "
+                f"SET last_snapshot = {self._sink_cursors[sink.sink_name]} "
+                f"WHERE sink_name = '{sink.sink_name}' AND mv_name = '{sink.table}'"
+            )
+            post = self._conn.execute(
+                f"SELECT MAX(snapshot_id) FROM ducklake_snapshots('{sink.catalog}')"
+            ).fetchone()
+            if post and post[0] is not None:
+                self._sink_cursors[sink.sink_name] = post[0]
+        return results
 
     # -- Catalog management --------------------------------------------------
 
@@ -193,8 +278,14 @@ class Orchestrator:
     def initialize(self) -> None:
         """Idempotently create cursor tables, MVs, and initialize cursors.
 
+        Runs source setup and initial sync before MV initialization.
         Safe to call multiple times — skips anything that already exists.
         """
+        # Set up and sync sources before MV init so base tables are populated
+        for source in self._sources:
+            source.setup(self._conn)
+            source.sync(self._conn)
+
         for reg in self._mvs.values():
             mv = reg.mv
             # CREATE TABLE IF NOT EXISTS for cursors
@@ -209,6 +300,33 @@ class Orchestrator:
                 self._conn.execute(mv.create_mv)
                 for stmt in mv.initialize_cursors:
                     self._conn.execute(stmt)
+
+        # Set up sinks and initialize their cursor table and rows
+        for sink in self._sinks:
+            sink.setup(self._conn)
+            cursors_fqn = f"{sink.catalog}.{sink.schema_}._sink_cursors"
+            self._conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {cursors_fqn} ("
+                f"sink_name VARCHAR, mv_name VARCHAR, last_snapshot BIGINT)"
+            )
+            # Init cursor to current max snapshot so first flush only sees
+            # future changes (not the initial load).
+            self._conn.execute(
+                f"INSERT INTO {cursors_fqn} (sink_name, mv_name, last_snapshot) "
+                f"SELECT '{sink.sink_name}', '{sink.table}', "
+                f"COALESCE(MAX(snapshot_id), 0) "
+                f"FROM ducklake_snapshots('{sink.catalog}') "
+                f"WHERE NOT EXISTS ("
+                f"SELECT 1 FROM {cursors_fqn} "
+                f"WHERE sink_name = '{sink.sink_name}' AND mv_name = '{sink.table}')"
+            )
+            # Load persisted cursor into in-memory cache
+            row = self._conn.execute(
+                f"SELECT last_snapshot FROM {cursors_fqn} "
+                f"WHERE sink_name = '{sink.sink_name}' AND mv_name = '{sink.table}'"
+            ).fetchone()
+            if row:
+                self._sink_cursors[sink.sink_name] = row[0]
 
     # -- Verification --------------------------------------------------------
 

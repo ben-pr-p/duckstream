@@ -119,6 +119,32 @@ def load_directory(
 
         orchestrator.add_catalog(name, _adapt)
 
+    # sources() — optional
+    if hasattr(module, "sources"):
+        sources_fn = module.sources
+        if not callable(sources_fn):
+            raise InvalidSetupError(f"{setup_path}: `sources` is not callable")
+        source_list = sources_fn()
+        if not isinstance(source_list, list):
+            raise InvalidSetupError(
+                f"{setup_path}: `sources()` must return a list, got {type(source_list).__name__}"
+            )
+        for source in source_list:
+            orchestrator.add_source(source)
+
+    # sinks() — optional
+    if hasattr(module, "sinks"):
+        sinks_fn = module.sinks
+        if not callable(sinks_fn):
+            raise InvalidSetupError(f"{setup_path}: `sinks` is not callable")
+        sink_list = sinks_fn()
+        if not isinstance(sink_list, list):
+            raise InvalidSetupError(
+                f"{setup_path}: `sinks()` must return a list, got {type(sink_list).__name__}"
+            )
+        for sink in sink_list:
+            orchestrator.add_sink(sink)
+
     # -- Walk catalogs/ ------------------------------------------------------
     catalogs_dir = root / "catalogs"
     if not catalogs_dir.is_dir():
