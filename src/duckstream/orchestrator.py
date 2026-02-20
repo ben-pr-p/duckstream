@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Literal
 import duckdb
 
 from duckstream.compiler import compile_ivm
+from duckstream.effectors.base import Effector, EffectorResult
 from duckstream.materialized_view import MaterializedView, Naming
 from duckstream.sinks.base import ChangeSet, FlushResult, Sink
 from duckstream.sources.base import Source, SyncResult
@@ -112,6 +113,7 @@ class Orchestrator:
         self._mvs: dict[str, _RegisteredMV] = {}  # keyed by fqn
         self._sources: list[Source] = []
         self._sinks: list[Sink] = []
+        self._effectors: list[Effector] = []
         self._sink_cursors: dict[str, int] = {}  # in-memory cache, persisted to DuckLake
         self._executor: ThreadPoolExecutor | None = None
         self._advance_state: _AdvanceState | None = None
@@ -224,6 +226,128 @@ class Orchestrator:
                 self._sink_cursors[sink.sink_name] = post[0]
         return results
 
+    # -- Effector management ------------------------------------------------
+
+    def add_effector(self, effector: Effector) -> None:
+        """Register an effector plugin."""
+        self._effectors.append(effector)
+
+    def flush_effectors(self) -> list[EffectorResult]:
+        """Flush all registered effectors. Returns list of EffectorResults.
+
+        For each effector, queries ducklake_table_changes() on the source MV,
+        calls the appropriate handle method per row, and batch INSERTs results
+        into the output table.
+        """
+        results: list[EffectorResult] = []
+        for effector in self._effectors:
+            last_snapshot = self._sink_cursors.get(effector.effector_name, 0)
+
+            latest = self._conn.execute(
+                f"SELECT MAX(snapshot_id) FROM ducklake_snapshots('{effector.catalog}')"
+            ).fetchone()
+            latest_snapshot = latest[0] if latest and latest[0] is not None else 0
+
+            if latest_snapshot <= last_snapshot:
+                results.append(EffectorResult())
+                continue
+
+            result = self._flush_one_effector(effector, last_snapshot, latest_snapshot)
+            results.append(result)
+
+            # Persist cursor (reuses _sink_cursors table)
+            cursors_fqn = f"{effector.catalog}.{effector.schema_}._sink_cursors"
+            self._conn.execute(
+                f"UPDATE {cursors_fqn} "
+                f"SET last_snapshot = {self._sink_cursors[effector.effector_name]} "
+                f"WHERE sink_name = '{effector.effector_name}' "
+                f"AND mv_name = '{effector.table}'"
+            )
+            post = self._conn.execute(
+                f"SELECT MAX(snapshot_id) FROM ducklake_snapshots('{effector.catalog}')"
+            ).fetchone()
+            if post and post[0] is not None:
+                self._sink_cursors[effector.effector_name] = post[0]
+
+        return results
+
+    def _flush_one_effector(
+        self,
+        effector: Effector,
+        last_snapshot: int,
+        latest_snapshot: int,
+    ) -> EffectorResult:
+        """Process changes for a single effector."""
+        self._conn.execute(f"SET VARIABLE _eff_start = {last_snapshot + 1}")
+        self._conn.execute(f"SET VARIABLE _eff_end = {latest_snapshot}")
+
+        rows = self._conn.execute(
+            f"SELECT * FROM ducklake_table_changes("
+            f"'{effector.catalog}', '{effector.schema_}', '{effector.table}', "
+            f"getvariable('_eff_start'), getvariable('_eff_end'))"
+        ).fetchall()
+
+        col_names = [
+            desc[0]
+            for desc in self._conn.execute(
+                f"SELECT * FROM ducklake_table_changes("
+                f"'{effector.catalog}', '{effector.schema_}', '{effector.table}', "
+                f"getvariable('_eff_start'), getvariable('_eff_end')) LIMIT 0"
+            ).description
+        ]
+
+        result = EffectorResult()
+        output_rows: list[dict] = []
+
+        for row in rows:
+            row_dict = dict(zip(col_names, row, strict=False))
+            change_type = row_dict.pop("change_type", None)
+            row_dict.pop("snapshot_id", None)
+            row_dict.pop("rowid", None)
+
+            try:
+                if change_type == "insert":
+                    out = effector.handle_insert(row_dict)
+                elif change_type == "delete":
+                    out = effector.handle_delete(row_dict)
+                elif change_type == "update_before":
+                    # Stash the old row for pairing with update_after
+                    _update_before = row_dict
+                    continue
+                elif change_type == "update_after":
+                    out = effector.handle_update(_update_before, row_dict)  # noqa: F821
+                else:
+                    continue
+            except Exception as e:
+                if effector.on_error == "raise":
+                    raise
+                elif effector.on_error == "skip":
+                    result.rows_errored += 1
+                    continue
+                else:  # "store"
+                    error_row = {name: None for name, _ in effector.columns}
+                    error_row["error"] = str(e)
+                    output_rows.append(error_row)
+                    result.rows_errored += 1
+                    continue
+
+            if out is None:
+                result.rows_skipped += 1
+            else:
+                output_rows.append(out)
+                result.rows_inserted += 1
+
+        if output_rows:
+            col_list = ", ".join(name for name, _ in effector.columns)
+            placeholders = ", ".join("?" for _ in effector.columns)
+            insert_sql = f"INSERT INTO {effector.output_fqn} ({col_list}) VALUES ({placeholders})"
+            for out_row in output_rows:
+                values = [out_row.get(name) for name, _ in effector.columns]
+                self._conn.execute(insert_sql, values)
+
+        self._sink_cursors[effector.effector_name] = latest_snapshot
+        return result
+
     # -- Catalog management --------------------------------------------------
 
     def add_catalog(
@@ -327,6 +451,38 @@ class Orchestrator:
             ).fetchone()
             if row:
                 self._sink_cursors[sink.sink_name] = row[0]
+
+        # Set up effectors: create output tables and initialize cursors
+        for effector in self._effectors:
+            effector.setup(self._conn)
+
+            # Create output table from effector.columns
+            col_defs = ", ".join(f"{name} {sql_type}" for name, sql_type in effector.columns)
+            self._conn.execute(f"CREATE TABLE IF NOT EXISTS {effector.output_fqn} ({col_defs})")
+
+            # Reuse _sink_cursors table for effector cursors
+            cursors_fqn = f"{effector.catalog}.{effector.schema_}._sink_cursors"
+            self._conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {cursors_fqn} ("
+                f"sink_name VARCHAR, mv_name VARCHAR, last_snapshot BIGINT)"
+            )
+            self._conn.execute(
+                f"INSERT INTO {cursors_fqn} (sink_name, mv_name, last_snapshot) "
+                f"SELECT '{effector.effector_name}', '{effector.table}', "
+                f"COALESCE(MAX(snapshot_id), 0) "
+                f"FROM ducklake_snapshots('{effector.catalog}') "
+                f"WHERE NOT EXISTS ("
+                f"SELECT 1 FROM {cursors_fqn} "
+                f"WHERE sink_name = '{effector.effector_name}' "
+                f"AND mv_name = '{effector.table}')"
+            )
+            row = self._conn.execute(
+                f"SELECT last_snapshot FROM {cursors_fqn} "
+                f"WHERE sink_name = '{effector.effector_name}' "
+                f"AND mv_name = '{effector.table}'"
+            ).fetchone()
+            if row:
+                self._sink_cursors[effector.effector_name] = row[0]
 
     # -- Verification --------------------------------------------------------
 

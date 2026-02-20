@@ -145,6 +145,20 @@ def load_directory(
         for sink in sink_list:
             orchestrator.add_sink(sink)
 
+    # effectors() — optional
+    if hasattr(module, "effectors"):
+        effectors_fn = module.effectors
+        if not callable(effectors_fn):
+            raise InvalidSetupError(f"{setup_path}: `effectors` is not callable")
+        effector_list = effectors_fn()
+        if not isinstance(effector_list, list):
+            raise InvalidSetupError(
+                f"{setup_path}: `effectors()` must return a list, "
+                f"got {type(effector_list).__name__}"
+            )
+        for effector in effector_list:
+            orchestrator.add_effector(effector)
+
     # -- Walk catalogs/ ------------------------------------------------------
     catalogs_dir = root / "catalogs"
     if not catalogs_dir.is_dir():
