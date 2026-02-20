@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import click
 
-from duckstream.cli import load_project
+from duckstream.file_loader import MVCompilationError, load_directory
+from duckstream.orchestrator import Orchestrator
 
 
 @click.command()
@@ -14,11 +15,13 @@ def plan(ctx: click.Context) -> None:
     project_dir = ctx.obj["project_dir"]
 
     try:
-        orch = load_project(project_dir)
+        orch = Orchestrator()
+        errors: list[MVCompilationError] = []
+        load_directory(project_dir, orch, errors=errors)
     except Exception as e:
         raise click.ClickException(str(e)) from e
 
-    if not orch._mvs:
+    if not orch._mvs and not errors:
         click.echo("No materialized views found.")
         return
 
@@ -36,11 +39,11 @@ def plan(ctx: click.Context) -> None:
     click.echo()
     click.echo(click.style("Maintenance Plan", bold=True))
     click.echo(click.style("=" * 60, dim=True))
-    click.echo()
 
-    for i, fqn in enumerate(ordered_fqns):
+    for fqn in ordered_fqns:
         reg = orch._mvs[fqn]
         mv = reg.mv
+        click.echo()
 
         # Header
         click.echo(click.style(f"  {fqn}", bold=True))
@@ -83,8 +86,17 @@ def plan(ctx: click.Context) -> None:
         # Maintenance steps
         click.echo(f"    Steps:     {len(mv.maintain)} SQL statements")
 
-        if i < len(ordered_fqns) - 1:
+    # Show compilation errors
+    if errors:
+        click.echo()
+        click.echo(click.style("  Errors", bold=True))
+        click.echo(click.style("  " + "-" * 56, dim=True))
+        for err in errors:
+            fqn = f"{err.catalog}.{err.schema}.{err.mv_name}"
             click.echo()
+            click.echo(click.style(f"  {fqn}", bold=True))
+            click.echo(f"    Strategy:  {click.style('error', fg='red')}")
+            click.echo(f"    Error:     {err.cause}")
 
     click.echo()
     click.echo(click.style("-" * 60, dim=True))
@@ -93,9 +105,12 @@ def plan(ctx: click.Context) -> None:
     total = len(ordered_fqns)
     incremental = sum(1 for fqn in ordered_fqns if orch._mvs[fqn].mv.strategy == "incremental")
     full_refresh = total - incremental
-    click.echo(
-        f"  {total} MVs: "
-        f"{click.style(str(incremental), fg='green')} incremental, "
-        f"{click.style(str(full_refresh), fg='yellow')} full refresh"
-    )
+    parts = [
+        f"{click.style(str(incremental), fg='green')} incremental",
+        f"{click.style(str(full_refresh), fg='yellow')} full refresh",
+    ]
+    if errors:
+        parts.append(f"{click.style(str(len(errors)), fg='red')} failed")
+        total += len(errors)
+    click.echo(f"  {total} MVs: {', '.join(parts)}")
     click.echo()

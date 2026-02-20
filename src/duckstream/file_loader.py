@@ -42,7 +42,23 @@ class InvalidSetupError(FileLoaderError): ...
 class MissingCatalogsError(FileLoaderError): ...
 
 
-def load_directory(directory: str | Path, orchestrator: Orchestrator) -> None:
+class MVCompilationError(FileLoaderError):
+    """A single MV failed to compile."""
+
+    def __init__(self, catalog: str, schema: str, mv_name: str, cause: Exception):
+        self.catalog = catalog
+        self.schema = schema
+        self.mv_name = mv_name
+        self.cause = cause
+        fqn = f"{catalog}.{schema}.{mv_name}"
+        super().__init__(f"{fqn}: {cause}")
+
+
+def load_directory(
+    directory: str | Path,
+    orchestrator: Orchestrator,
+    errors: list[MVCompilationError] | None = None,
+) -> None:
     """Load a project directory into the orchestrator.
 
     1. Imports setup.py and calls its exported functions:
@@ -50,6 +66,9 @@ def load_directory(directory: str | Path, orchestrator: Orchestrator) -> None:
        - secrets(conn) if present
        - catalogs() to get catalog attach functions
     2. Walks catalogs/ to register MV definitions via add_ivm().
+
+    If ``errors`` is provided, compilation failures are appended to it
+    instead of raising immediately. Setup/catalog-level errors always raise.
     """
     root = Path(directory)
 
@@ -109,7 +128,7 @@ def load_directory(directory: str | Path, orchestrator: Orchestrator) -> None:
         if not catalog_path.is_dir():
             continue
         catalog_name = catalog_path.name
-        _load_catalog(catalog_path, catalog_name, orchestrator)
+        _load_catalog(catalog_path, catalog_name, orchestrator, errors)
 
 
 def _load_setup_module(setup_path: Path):
@@ -131,24 +150,52 @@ def _load_setup_module(setup_path: Path):
     return module
 
 
-def _load_catalog(catalog_path: Path, catalog_name: str, orchestrator: Orchestrator) -> None:
+def _load_catalog(
+    catalog_path: Path,
+    catalog_name: str,
+    orchestrator: Orchestrator,
+    errors: list[MVCompilationError] | None = None,
+) -> None:
     """Load all MVs from a catalog directory."""
     for entry in sorted(catalog_path.iterdir()):
         if entry.is_file() and entry.suffix == ".sql":
             mv_name = entry.stem
             sql = entry.read_text().strip()
-            orchestrator.add_ivm(catalog_name, mv_name, sql)
+            _try_add_ivm(orchestrator, catalog_name, mv_name, sql, "main", errors)
         elif entry.is_dir():
             schema_name = entry.name
-            _load_schema(entry, catalog_name, schema_name, orchestrator)
+            _load_schema(entry, catalog_name, schema_name, orchestrator, errors)
 
 
 def _load_schema(
-    schema_path: Path, catalog_name: str, schema_name: str, orchestrator: Orchestrator
+    schema_path: Path,
+    catalog_name: str,
+    schema_name: str,
+    orchestrator: Orchestrator,
+    errors: list[MVCompilationError] | None = None,
 ) -> None:
     """Load all MVs from a schema subdirectory."""
     for entry in sorted(schema_path.iterdir()):
         if entry.is_file() and entry.suffix == ".sql":
             mv_name = entry.stem
             sql = entry.read_text().strip()
-            orchestrator.add_ivm(catalog_name, mv_name, sql, schema=schema_name)
+            _try_add_ivm(orchestrator, catalog_name, mv_name, sql, schema_name, errors)
+
+
+def _try_add_ivm(
+    orchestrator: Orchestrator,
+    catalog_name: str,
+    mv_name: str,
+    sql: str,
+    schema_name: str,
+    errors: list[MVCompilationError] | None,
+) -> None:
+    """Try to add an IVM, collecting errors if an error list is provided."""
+    try:
+        orchestrator.add_ivm(catalog_name, mv_name, sql, schema=schema_name)
+    except Exception as e:
+        err = MVCompilationError(catalog_name, schema_name, mv_name, e)
+        if errors is not None:
+            errors.append(err)
+        else:
+            raise err from e
