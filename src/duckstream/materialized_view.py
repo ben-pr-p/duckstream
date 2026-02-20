@@ -27,6 +27,7 @@ class MaterializedView:
     features: set[str] = field(default_factory=set)
     query_mv: str = ""
     inner_mvs: list["MaterializedView"] = field(default_factory=list)
+    strategy: str = "incremental"  # "incremental" or "full_refresh"
 
 
 class UnsupportedSQLError(Exception):

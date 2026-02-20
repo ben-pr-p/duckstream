@@ -59,6 +59,7 @@ class MaintenanceStep:
     schema: str
     mv_name: str
     mv: MaterializedView
+    strategy: str = "incremental"
     pending_snapshots: int | None = None
     pending_rows: int | None = None
     skipped: bool = False
@@ -337,7 +338,9 @@ class Orchestrator:
 
         def _add_mv_tree(mv_fqn: str, prefix: str, is_last: bool) -> None:
             connector = "\u2514\u2500\u2500 " if is_last else "\u251c\u2500\u2500 "
-            lines.append(f"{prefix}{connector}{mv_fqn} (MV)")
+            reg = self._mvs[mv_fqn]
+            label = "(MV, full refresh)" if reg.mv.strategy == "full_refresh" else "(MV)"
+            lines.append(f"{prefix}{connector}{mv_fqn} {label}")
             child_prefix = prefix + ("    " if is_last else "\u2502   ")
             dependents = sorted(reverse_deps.get(mv_fqn, []))
             for i, dep_fqn in enumerate(dependents):
@@ -380,6 +383,7 @@ class Orchestrator:
                     schema=reg.schema,
                     mv_name=reg.mv_name,
                     mv=reg.mv,
+                    strategy=reg.mv.strategy,
                 )
 
                 if detail_level in ("cursor_distance", "rows_changed"):

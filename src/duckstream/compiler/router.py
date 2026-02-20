@@ -37,9 +37,46 @@ def compile_ivm(
     mv_schema: str = "main",
     sources: dict[str, dict] | None = None,
 ) -> MaterializedView:
-    """Compile a view definition into IVM maintenance SQL."""
-    dialect = "duckdb"
+    """Compile a view definition into IVM maintenance SQL.
+
+    Tries incremental compilation first. On UnsupportedSQLError, falls back
+    to full-refresh + bag-diff maintenance (unless the error is a genuinely
+    invalid query like no_table or having_no_agg).
+    """
     naming = naming or Naming()
+    try:
+        return _compile_ivm_inner(
+            view_sql,
+            naming=naming,
+            mv_catalog=mv_catalog,
+            mv_schema=mv_schema,
+            sources=sources,
+        )
+    except UnsupportedSQLError as e:
+        # Don't fall back on genuinely invalid queries
+        if e.feature in ("no_table", "having_no_agg"):
+            raise
+        from duckstream.compiler.full_refresh import compile_full_refresh
+
+        return compile_full_refresh(
+            view_sql,
+            naming=naming,
+            mv_catalog=mv_catalog,
+            mv_schema=mv_schema,
+            sources=sources,
+        )
+
+
+def _compile_ivm_inner(
+    view_sql: str,
+    *,
+    naming: Naming,
+    mv_catalog: str = "dl",
+    mv_schema: str = "main",
+    sources: dict[str, dict] | None = None,
+) -> MaterializedView:
+    """Core incremental IVM compilation. Raises UnsupportedSQLError on failure."""
+    dialect = "duckdb"
     parsed = sqlglot.parse_one(view_sql, dialect=dialect)
 
     # --- Set operations (UNION/EXCEPT/INTERSECT) ---

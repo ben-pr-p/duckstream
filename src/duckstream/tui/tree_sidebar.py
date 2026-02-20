@@ -64,7 +64,9 @@ class TreeSidebar(Tree):
             for table_name in sorted(catalog_tables[cat]):
                 table_node = cat_node.add(f"📄 {table_name}", expand=True)
                 for fqn in sorted(table_to_mvs.get((cat, table_name), [])):
-                    mv_node = table_node.add_leaf(f"⚡ {fqn}")
+                    reg = orchestrator._mvs[fqn]
+                    icon = "🔄" if reg.mv.strategy == "full_refresh" else "⚡"
+                    mv_node = table_node.add_leaf(f"{icon} {fqn}")
                     mv_node.data = fqn
                     self._mv_fqns.append(fqn)
 

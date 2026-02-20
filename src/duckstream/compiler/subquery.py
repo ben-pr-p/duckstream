@@ -854,9 +854,7 @@ def _rewrite_select_subqueries(
 
         # Replace the scalar subquery with a LEFT JOIN to the inner MV.
         # The SELECT expression becomes a simple column reference: mv_xxx.out_alias
-        mv_fqn_table = exp.table_(
-            inner_mv_name, db=ctx.mv_schema, catalog=ctx.mv_catalog
-        )
+        mv_fqn_table = exp.table_(inner_mv_name, db=ctx.mv_schema, catalog=ctx.mv_catalog)
 
         # Build ON condition: mv_xxx.inner_col = outer.col
         on_parts: list[exp.Expression] = []
@@ -877,9 +875,7 @@ def _rewrite_select_subqueries(
         ast.set("joins", existing_joins)
 
         # Replace the subquery SELECT expression with a column reference
-        new_selects.append(
-            exp.alias_(exp.column(out_alias, table=inner_mv_name), out_alias)
-        )
+        new_selects.append(exp.alias_(exp.column(out_alias, table=inner_mv_name), out_alias))
 
     ast.args["expressions"] = new_selects
     return ast, inner_mvs

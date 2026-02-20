@@ -38,7 +38,8 @@ def _run_plain(orch):
     for step in steps:
         status = "skipped" if step.skipped else f"{step.duration_ms:.0f}ms"
         pending = f" ({step.pending_snapshots} pending)" if step.pending_snapshots else ""
-        click.echo(f"  {step.catalog}.{step.schema}.{step.mv_name}: {status}{pending}")
+        strategy = " [full refresh]" if step.strategy == "full_refresh" else ""
+        click.echo(f"  {step.catalog}.{step.schema}.{step.mv_name}{strategy}: {status}{pending}")
 
     click.echo("Maintenance complete.")
 
@@ -63,10 +64,11 @@ def _run_tui(orch):
                 if step_result is None:
                     break
                 fqn = f"{step_result.catalog}.{step_result.schema}.{step_result.mv_name}"
+                strategy = " [full refresh]" if step_result.strategy == "full_refresh" else ""
                 if step_result.skipped:
-                    log.write(f"  [dim]{fqn}: skipped[/dim]")
+                    log.write(f"  [dim]{fqn}{strategy}: skipped[/dim]")
                 else:
-                    log.write(f"  [green]{fqn}[/green]: {step_result.duration_ms:.0f}ms")
+                    log.write(f"  [green]{fqn}{strategy}[/green]: {step_result.duration_ms:.0f}ms")
 
             log.write("")
             log.write("[bold green]Maintenance complete.[/bold green]")
