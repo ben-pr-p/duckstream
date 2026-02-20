@@ -168,6 +168,28 @@ def read_mv(
     return sorted(result, key=_null_safe_sort_key)
 
 
+def _initialize_mv(con, plan):
+    """Initialize a MaterializedView and all its inner MVs (depth-first)."""
+    # Initialize inner MVs first (they must exist before the outer MV)
+    for inner in plan.inner_mvs:
+        _initialize_mv(con, inner)
+
+    con.execute(plan.create_cursors_table)
+    con.execute(plan.create_mv)
+    for stmt in plan.initialize_cursors:
+        con.execute(stmt)
+
+
+def _maintain_mv(con, plan):
+    """Run maintenance for a MaterializedView and all its inner MVs (depth-first)."""
+    # Maintain inner MVs first (they must be up-to-date before the outer MV)
+    for inner in plan.inner_mvs:
+        _maintain_mv(con, inner)
+
+    for stmt in plan.maintain:
+        con.execute(stmt)
+
+
 def assert_ivm_correct(scenario: Scenario, ducklake_fixture):
     """The core correctness check: maintained MV == recomputed view."""
     con, catalog = ducklake_fixture
@@ -181,18 +203,14 @@ def assert_ivm_correct(scenario: Scenario, ducklake_fixture):
         mv_catalog=catalog,
     )
 
-    # 3. Set up MV and cursors
-    con.execute(plan.create_cursors_table)
-    con.execute(plan.create_mv)
-    for stmt in plan.initialize_cursors:
-        con.execute(stmt)
+    # 3. Set up MV and cursors (including inner MVs)
+    _initialize_mv(con, plan)
 
     # 4. Apply deltas to DuckLake base tables
     apply_deltas(con, scenario, catalog)
 
-    # 5. Run maintenance SQL
-    for stmt in plan.maintain:
-        con.execute(stmt)
+    # 5. Run maintenance SQL (including inner MVs)
+    _maintain_mv(con, plan)
 
     # 6. Read maintained MV (excluding _ivm_* columns, applying HAVING if present)
     if plan.query_mv:

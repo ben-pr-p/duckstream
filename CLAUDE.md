@@ -40,3 +40,12 @@ Read these before working on the codebase:
 - Deltas via `ducklake_table_changes()` — no manual delta tables
 - Tests use **Hypothesis** property-based testing with DuckDB as the oracle
 - Each test gets its own isolated DuckLake instance via `tempfile.mkdtemp()`
+
+## Inner MVs / Subquery rewriting
+
+When a subquery is too complex to flatten (e.g. scalar subqueries with aggregates, FROM subqueries with GROUP BY), it is compiled as a **recursive inner MV** — a separate DuckLake table maintained independently.
+
+**Key design rule:** The outer MV must always track the inner MV as a real source table. Never defer subquery-derived columns to read time via `query_mv`. Instead, rewrite the outer query as a LEFT JOIN to the inner MV so that:
+1. The inner MV is a DuckLake table with proper `ducklake_table_changes()` tracking.
+2. The outer MV is maintained when *either* the base table or the inner MV changes.
+3. The existing join IVM compiler handles the outer MV's maintenance.

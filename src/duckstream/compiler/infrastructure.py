@@ -181,7 +181,13 @@ def _gen_init_cursor(cursors_fqn: str, mv_table: str, src: dict[str, str]) -> st
 
 
 def _repoint_columns_to_delta(node: exp.Expression) -> exp.Expression:
-    """Repoint column references to the _delta alias."""
+    """Repoint column references to the _delta alias.
+
+    Skips subquery contents — scalar subqueries referencing inner MVs
+    should keep their original column references.
+    """
+    if isinstance(node, exp.Subquery):
+        return node  # Don't descend into subqueries
     if isinstance(node, exp.Column):
         return exp.column(node.name, table="_delta")
     return node

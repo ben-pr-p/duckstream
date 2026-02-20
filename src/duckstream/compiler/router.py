@@ -25,6 +25,7 @@ from duckstream.compiler.join_aggregate import _compile_join_aggregate
 from duckstream.compiler.outer_join import _compile_outer_join
 from duckstream.compiler.select import _gen_select_maintenance
 from duckstream.compiler.set_ops import _compile_set_operation
+from duckstream.compiler.subquery import CompilationContext, has_subqueries, rewrite_subqueries
 from duckstream.materialized_view import MaterializedView, Naming, UnsupportedSQLError
 
 
@@ -54,6 +55,18 @@ def compile_ivm(
 
     assert isinstance(parsed, exp.Select), f"Expected SELECT, got {type(parsed)}"
     ast: exp.Select = parsed
+
+    # --- Subquery rewriting pass ---
+    inner_mvs: list[MaterializedView] = []
+    if has_subqueries(ast):
+        ctx = CompilationContext(
+            naming=naming,
+            mv_catalog=mv_catalog,
+            mv_schema=mv_schema,
+            sources=sources,
+            dialect=dialect,
+        )
+        ast, inner_mvs = rewrite_subqueries(ast, dialect, ctx)
 
     # --- Analysis ---
     tables = list(ast.find_all(exp.Table))
@@ -92,7 +105,7 @@ def compile_ivm(
             compile_fn = _compile_join_aggregate
         else:
             compile_fn = _compile_join
-        return compile_fn(
+        mv = compile_fn(
             ast,
             tables,
             joins,
@@ -106,6 +119,8 @@ def compile_ivm(
             cursors_fqn,
             create_cursors,
         )
+        mv.inner_mvs = inner_mvs
+        return mv
 
     if has_distinct and (has_agg or has_join):
         raise UnsupportedSQLError(
@@ -144,4 +159,5 @@ def compile_ivm(
         base_tables={table_name: src["catalog"]},
         features=features,
         query_mv=query_mv,
+        inner_mvs=inner_mvs,
     )

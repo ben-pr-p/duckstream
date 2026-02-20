@@ -26,6 +26,7 @@ class MaterializedView:
     base_tables: dict[str, str]  # table_name -> catalog
     features: set[str] = field(default_factory=set)
     query_mv: str = ""
+    inner_mvs: list["MaterializedView"] = field(default_factory=list)
 
 
 class UnsupportedSQLError(Exception):
