@@ -35,9 +35,11 @@ def main(ctx: click.Context, project_dir: str) -> None:
 from duckstream.cli.dev_cmd import dev  # noqa: E402
 from duckstream.cli.init_cmd import init  # noqa: E402
 from duckstream.cli.maintain_cmd import maintain  # noqa: E402
+from duckstream.cli.plan_cmd import plan  # noqa: E402
 from duckstream.cli.watch_cmd import watch  # noqa: E402
 
 main.add_command(init)
 main.add_command(dev)
 main.add_command(maintain)
+main.add_command(plan)
 main.add_command(watch)

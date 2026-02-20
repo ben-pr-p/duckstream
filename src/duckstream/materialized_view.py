@@ -28,6 +28,7 @@ class MaterializedView:
     query_mv: str = ""
     inner_mvs: list["MaterializedView"] = field(default_factory=list)
     strategy: str = "incremental"  # "incremental" or "full_refresh"
+    fallback_reason: str = ""  # why full_refresh was chosen (UnsupportedSQLError message)
 
 
 class UnsupportedSQLError(Exception):

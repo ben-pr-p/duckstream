@@ -58,13 +58,15 @@ def compile_ivm(
             raise
         from duckstream.compiler.full_refresh import compile_full_refresh
 
-        return compile_full_refresh(
+        mv = compile_full_refresh(
             view_sql,
             naming=naming,
             mv_catalog=mv_catalog,
             mv_schema=mv_schema,
             sources=sources,
         )
+        mv.fallback_reason = e.message
+        return mv
 
 
 def _compile_ivm_inner(
