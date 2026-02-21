@@ -1,7 +1,10 @@
 """Tests for subquery rewriting and IVM maintenance."""
 
-from tests.conftest import assert_ivm_correct
+from hypothesis import HealthCheck, given, settings
+
+from tests.conftest import assert_ivm_correct, make_ducklake
 from tests.strategies import Column, Delta, Row, Scenario, Table
+from tests.strategies.subquery import not_in_with_null_outer
 
 
 class TestFromSubquery:
@@ -188,6 +191,48 @@ class TestNotInSubquery:
             ],
         )
         assert_ivm_correct(scenario, ducklake)
+
+    def test_not_in_with_null_outer(self, ducklake):
+        """NOT IN should exclude NULLs from the outer column."""
+        scenario = Scenario(
+            tables=[
+                Table("orders", [Column("id", "INTEGER"), Column("cid", "INTEGER")]),
+                Table("blocked", [Column("cid", "INTEGER")]),
+            ],
+            initial_data={
+                "orders": [
+                    Row({"id": 1, "cid": 1}),
+                    Row({"id": 2, "cid": None}),
+                    Row({"id": 3, "cid": 2}),
+                ],
+                "blocked": [Row({"cid": 2})],
+            },
+            view_sql=(
+                "SELECT orders.id, orders.cid "
+                "FROM orders "
+                "WHERE orders.cid NOT IN (SELECT cid FROM blocked)"
+            ),
+            deltas=[
+                Delta("blocked", inserts=[Row({"cid": 1})], deletes=[]),
+                Delta("orders", inserts=[Row({"id": 4, "cid": None})], deletes=[]),
+            ],
+        )
+        assert_ivm_correct(scenario, ducklake)
+
+
+@given(scenario=not_in_with_null_outer())
+@settings(
+    max_examples=50,
+    suppress_health_check=[HealthCheck.too_slow],
+    deadline=None,
+)
+def test_not_in_with_null_outer_property(scenario):
+    """NOT IN should never return rows with NULL outer values."""
+    con, catalog, cleanup = make_ducklake()
+    try:
+        assert_ivm_correct(scenario, (con, catalog))
+    finally:
+        cleanup()
 
 
 class TestExistsSubquery:

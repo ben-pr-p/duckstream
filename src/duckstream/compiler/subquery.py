@@ -581,7 +581,10 @@ def _rewrite_in_subquery(
         inner_expr = inner_col_expr.copy().transform(_rewrite_inner_refs)
         exists_pred = exp.Or(
             this=exp.EQ(this=inner_expr.copy(), expression=outer_col_ref.copy()),
-            expression=exp.Is(this=inner_expr.copy(), expression=exp.Null()),
+            expression=exp.Or(
+                this=exp.Is(this=inner_expr.copy(), expression=exp.Null()),
+                expression=exp.Is(this=outer_col_ref.copy(), expression=exp.Null()),
+            ),
         )
 
         inner_where = inner_select.args.get("where")
