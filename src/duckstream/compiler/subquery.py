@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from typing import cast
 
 from sqlglot import exp
 
@@ -241,7 +242,7 @@ def _compile_from_subquery_as_mv(
             return exp.column(node.name, table=inner_mv_name)
         return node
 
-    outer = outer.transform(_rewrite_col_ref)
+    outer = cast(exp.Select, outer.transform(_rewrite_col_ref))
     return outer, inner_mv, inner_mv_name
 
 
@@ -296,7 +297,7 @@ def _flatten_derived_table(
                 return exp.column(node.name, table=inner_table_name)
         return node
 
-    outer = outer.transform(_rewrite_col_ref)
+    outer = cast(exp.Select, outer.transform(_rewrite_col_ref))
 
     # Merge inner WHERE into outer WHERE
     inner_where = inner.args.get("where")
@@ -376,7 +377,7 @@ def _flatten_join_subquery(
                 return exp.column(node.name, table=alias)
         return node
 
-    outer = outer.transform(_rewrite_col_ref)
+    outer = cast(exp.Select, outer.transform(_rewrite_col_ref))
 
     # Merge inner WHERE into join ON condition
     inner_where = inner.args.get("where")
@@ -410,6 +411,8 @@ def _rewrite_where_subqueries(ast: exp.Select, dialect: str) -> exp.Select:
 
     ast = ast.copy()
     where = ast.args.get("where")
+    if not where:
+        return ast
 
     # Collect all subquery predicates
     # We need to process them and convert to joins
@@ -551,43 +554,50 @@ def _rewrite_in_subquery(
         ast.set("distinct", exp.Distinct())
 
     else:
-        # NOT IN -> anti-join via LEFT JOIN + IS NULL
+        # NOT IN -> rewrite to correlated NOT EXISTS with NULL-aware predicate
         _remove_predicate(ast, exp.Not(this=in_node))
 
-        if isinstance(inner_col_expr, exp.Column):
-            on_col = exp.column(inner_col_expr.name, table=join_ref)
-        else:
-            on_col = inner_col_expr.copy()
+        outer_col_ref = outer_col.copy()
+        if not outer_col_ref.table:
+            outer_tables = _get_table_names(ast)
+            if len(outer_tables) == 1:
+                outer_col_ref = exp.column(outer_col_ref.name, table=next(iter(outer_tables)))
+            else:
+                raise UnsupportedSQLError(
+                    "unqualified_column",
+                    "NOT IN requires table-qualified column when multiple tables present",
+                )
 
-        on_cond = exp.EQ(this=outer_col.copy(), expression=on_col)
+        outer_tables = _get_table_names(ast)
+
+        def _rewrite_inner_refs(node: exp.Expression) -> exp.Expression:
+            if isinstance(node, exp.Column):
+                if node.table == inner_table_name or (
+                    not node.table and node.table not in outer_tables
+                ):
+                    return exp.column(node.name, table=join_ref)
+            return node
+
+        inner_expr = inner_col_expr.copy().transform(_rewrite_inner_refs)
+        exists_pred = exp.Or(
+            this=exp.EQ(this=inner_expr.copy(), expression=outer_col_ref.copy()),
+            expression=exp.Is(this=inner_expr.copy(), expression=exp.Null()),
+        )
 
         inner_where = inner_select.args.get("where")
         if inner_where:
-            inner_where_rewritten = inner_where.this.copy().transform(
-                lambda n: (
-                    exp.column(n.name, table=join_ref)
-                    if isinstance(n, exp.Column)
-                    and (n.table == inner_table_name or not n.table)
-                    and n.table not in _get_table_names(ast)
-                    else n
-                )
-            )
-            on_cond = exp.And(this=on_cond, expression=inner_where_rewritten)
-
-        join_table = inner_table.copy()
-        new_join = exp.Join(this=join_table, on=on_cond, side="LEFT")
-        existing_joins = ast.args.get("joins") or []
-        existing_joins.append(new_join)
-        ast.set("joins", existing_joins)
-
-        # Add IS NULL filter for anti-join
-        null_check = exp.Is(this=on_col.copy(), expression=exp.Null())
-        existing_where = ast.args.get("where")
-        if existing_where:
-            combined = exp.And(this=existing_where.this, expression=null_check)
-            ast.set("where", exp.Where(this=combined))
+            inner_where_rewritten = inner_where.this.copy().transform(_rewrite_inner_refs)
+            combined_where = exp.And(this=inner_where_rewritten, expression=exists_pred)
         else:
-            ast.set("where", exp.Where(this=null_check))
+            combined_where = exists_pred
+
+        inner_select_copy = inner_select.copy()
+        inner_select_copy.set("where", exp.Where(this=combined_where))
+
+        exists_node = exp.Exists(this=inner_select_copy)
+        ast = _rewrite_exists_subquery(
+            ast, exists_node, inner_select_copy, negated=True, dialect=dialect
+        )
 
     return ast
 
@@ -703,12 +713,8 @@ def _rewrite_exists_subquery(
         existing_joins.append(new_join)
         ast.set("joins", existing_joins)
 
-        # Find a column from the inner table to check for NULL
-        inner_col_for_null = _find_inner_join_key(correlation_preds, inner_table_name)
-        null_check = exp.Is(
-            this=exp.column(inner_col_for_null, table=join_ref),
-            expression=exp.Null(),
-        )
+        # Use rowid to detect existence (nullable columns are unsafe)
+        null_check = exp.Is(this=exp.column("rowid", table=join_ref), expression=exp.Null())
         existing_where = ast.args.get("where")
         if existing_where:
             combined = exp.And(this=existing_where.this, expression=null_check)

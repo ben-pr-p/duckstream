@@ -54,3 +54,32 @@ def test_select_insert_delete_roundtrip():
         assert rows == expected
     finally:
         cleanup()
+
+
+def test_not_in_subquery_with_null():
+    """NOT IN subquery should respect NULL semantics."""
+    con, catalog, cleanup = make_ducklake()
+    try:
+        con.execute(f"CREATE TABLE {catalog}.customers (id INTEGER)")
+        con.execute(f"CREATE TABLE {catalog}.blocked (cid INTEGER)")
+        con.execute(f"INSERT INTO {catalog}.customers VALUES (1), (2), (3)")
+        con.execute(f"INSERT INTO {catalog}.blocked VALUES (NULL)")
+
+        view_sql = (
+            "SELECT customers.id FROM customers WHERE customers.id NOT IN (SELECT cid FROM blocked)"
+        )
+        plan = compile_ivm(view_sql, mv_catalog=catalog)
+
+        con.execute(plan.create_cursors_table)
+        con.execute(plan.create_mv)
+        for stmt in plan.initialize_cursors:
+            con.execute(stmt)
+
+        maintained = con.execute(plan.query_mv).fetchall()
+        con.execute(f"USE {catalog}")
+        expected = con.execute(view_sql).fetchall()
+        con.execute("USE memory")
+
+        assert maintained == expected
+    finally:
+        cleanup()
